@@ -22,7 +22,7 @@ client_ai = genai.Client(api_key=GEMINI_API_KEY)
 app = Client("fast_image_userbot", api_id=API_ID, api_hash=API_HASH)
 
 def get_market_data_answer(ticker_symbol: str) -> str:
-    """Fetches exact spot market data directly from the logged-in Exness MT5 Terminal using the .m suffix."""
+    """Fetches exact daily candles with dates directly from the Exness MT5 Terminal."""
     try:
         clean_symbol = ticker_symbol.strip().upper().replace("/", "").replace("=", "").replace("-", "").replace(" ", "")
         
@@ -36,7 +36,6 @@ def get_market_data_answer(ticker_symbol: str) -> str:
         elif clean_symbol in ["ETHUSD", "ETH"]:
             mt5_symbol = "ETHUSDm"
         else:
-            # Automatically append 'm' suffix for standard forex pairs if not already present
             if not clean_symbol.endswith("M"):
                 mt5_symbol = clean_symbol + "m"
             else:
@@ -47,32 +46,37 @@ def get_market_data_answer(ticker_symbol: str) -> str:
             print(f"❌ MT5 initialization failed: {mt5.last_error()}")
             return None
 
-        # Make sure symbol is selected in Market Watch
         mt5.symbol_select(mt5_symbol, True)
         
-        # Request 7 Daily bars directly from Exness
-        rates = mt5.copy_rates_from_pos(mt5_symbol, mt5.TIMEFRAME_D1, 0, 7)
-        mt5.shutdown() # Close connection after reading
+        # Request the last 14 daily bars to cover both last week and this week
+        rates = mt5.copy_rates_from_pos(mt5_symbol, mt5.TIMEFRAME_D1, 0, 14)
+        mt5.shutdown()
 
         if rates is not None and len(rates) > 0:
             df = pd.DataFrame(rates)
-            lowest_price = df['low'].min()
-            highest_price = df['high'].max()
-            current_price = df['close'].iloc[-1]
+            df['time'] = pd.to_datetime(df['time'], unit='s')
+            
+            # Build a clear date-by-date breakdown for Gemini
+            price_records = []
+            for _, row in df.iterrows():
+                date_str = row['time'].strftime('%Y-%m-%d')
+                price_records.append(f"Date: {date_str} | Low: {row['low']:.3f} | High: {row['high']:.3f} | Close: {row['close']:.3f}")
 
-            print(f"📊 [EXNESS DIRECT FEED] {mt5_symbol} | Low: {lowest_price:.3f}")
+            absolute_low = df['low'].min()
+            absolute_high = df['high'].max()
+
+            print(f"📊 [EXNESS DIRECT FEED] {mt5_symbol} fetched {len(df)} daily candles.")
             return (
-                f"Official Exness Terminal Data for {mt5_symbol}:\n"
-                f"- Lowest price this week: {lowest_price:.3f}\n"
-                f"- Highest price this week: {highest_price:.3f}\n"
-                f"- Current price: {current_price:.3f}"
+                f"Official Exness Daily Candles for {mt5_symbol} (Last 14 Days):\n" +
+                "\n".join(price_records) +
+                f"\n\nAbsolute Lowest Price in Period: {absolute_low:.3f}\n"
+                f"Absolute Highest Price in Period: {absolute_high:.3f}"
             )
         else:
             print(f"⚠️ Symbol '{mt5_symbol}' not found in Exness Market Watch.")
     except Exception as e:
         print(f"❌ MT5 Fetch Error for {ticker_symbol}: {e}")
     return None
-
 def solve_question_image(image_path: str) -> str:
     """Extracts ticker & question from image, pulls exact Exness prices, and solves it."""
     try:
