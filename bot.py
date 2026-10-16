@@ -1,5 +1,11 @@
-import os
 import asyncio
+import sys
+
+# Fix Windows terminal encoding so emoji in print() never crashes
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+
+
 from io import BytesIO
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -22,41 +28,45 @@ client_ai = genai.Client(api_key=GEMINI_API_KEY)
 # Initialize Telegram Userbot Session
 app = Client("fast_image_userbot", api_id=API_ID, api_hash=API_HASH)
 
+# Cache MT5 init state — avoids slow terminal_info() check on every message
+_mt5_initialized = False
+
+def ensure_mt5() -> bool:
+    """Returns True if MT5 is ready, using a cached flag for speed."""
+    global _mt5_initialized
+    if not _mt5_initialized:
+        _mt5_initialized = mt5.initialize()
+    return _mt5_initialized
+
 def get_market_data_answer(ticker_symbol: str) -> str:
     """Fetches exact daily candles instantly using the persistent MT5 connection."""
     try:
         clean_symbol = ticker_symbol.strip().upper().replace("/", "").replace("=", "").replace("-", "").replace(" ", "")
         
-        # Map common names to Exness specific .m tickers
-        if clean_symbol in ["GOLD", "XAUUSD"]:
-            mt5_symbol = "XAUUSDm"
-        elif clean_symbol in ["SILVER", "XAGUSD"]:
-            mt5_symbol = "XAGUSDm"
-        elif clean_symbol in ["BTCUSD", "BTC"]:
-            mt5_symbol = "BTCUSDm"
-        elif clean_symbol in ["ETHUSD", "ETH"]:
-            mt5_symbol = "ETHUSDm"
-        else:
-            mt5_symbol = clean_symbol if clean_symbol.endswith("M") else clean_symbol + "m"
+        # O(1) dict lookup instead of sequential if/elif
+        symbol_map = {
+            "GOLD": "XAUUSDm", "XAUUSD": "XAUUSDm",
+            "SILVER": "XAGUSDm", "XAGUSD": "XAGUSDm",
+            "BTCUSD": "BTCUSDm", "BTC": "BTCUSDm",
+            "ETHUSD": "ETHUSDm", "ETH": "ETHUSDm",
+        }
+        mt5_symbol = symbol_map.get(clean_symbol, clean_symbol if clean_symbol.endswith("M") else clean_symbol + "m")
 
-        # Ensure MT5 is active
-        if not mt5.terminal_info():
-            mt5.initialize()
+        if not ensure_mt5():
+            print("❌ MT5 not available.")
+            return None
 
         mt5.symbol_select(mt5_symbol, True)
-        
-        # Request the last 14 daily bars
         rates = mt5.copy_rates_from_pos(mt5_symbol, mt5.TIMEFRAME_D1, 0, 14)
 
         if rates is not None and len(rates) > 0:
             df = pd.DataFrame(rates)
             df['time'] = pd.to_datetime(df['time'], unit='s')
-            
-            price_records = []
-            for _, row in df.iterrows():
-                date_str = row['time'].strftime('%Y-%m-%d')
-                price_records.append(f"Date: {date_str} | Low: {row['low']:.3f} | High: {row['high']:.3f} | Close: {row['close']:.3f}")
 
+            price_records = [
+                f"Date: {row['time'].strftime('%Y-%m-%d')} | Low: {row['low']:.3f} | High: {row['high']:.3f} | Close: {row['close']:.3f}"
+                for _, row in df.iterrows()
+            ]
             absolute_low = df['low'].min()
             absolute_high = df['high'].max()
 
@@ -74,11 +84,11 @@ def get_market_data_answer(ticker_symbol: str) -> str:
     return None
 
 def solve_question_image(photo_bytes: BytesIO) -> str:
-    """Processes image from memory, fetches MT5 data, and queries Gemini rapidly."""
+    """Processes image from memory, fetches MT5 data, and queries Gemini."""
     try:
         img = Image.open(photo_bytes)
         
-        # Step 1: Extract question and ticker from image
+        # Step 1: Extract ticker + question from image
         extract_prompt = (
             "Analyze this trading quiz image. "
             "1. Identify the asset symbol/ticker being asked about (e.g., EURUSD, XAUUSD, BTCUSD). "
@@ -86,13 +96,13 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
             "Output strictly in this format: TICKER: <symbol> | QUESTION: <question text>"
         )
         query_response = client_ai.models.generate_content(
-            model='gemini-3.5-flash',
+            model='gemini-2.5-flash',
             contents=[extract_prompt, img]
         )
         extracted_text = query_response.text.strip()
         print(f"🔎 [EXTRACTED DATA]: {extracted_text}")
         
-        ticker_symbol = "XAUUSD" 
+        ticker_symbol = "XAUUSD"
         question_text = extracted_text
         
         if "|" in extracted_text:
@@ -103,15 +113,15 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
                 elif "QUESTION:" in part:
                     question_text = part.replace("QUESTION:", "").strip()
 
-        # Step 2: Fetch exact live data from local Exness MT5 app instantly
+        # Step 2: Fetch live MT5 data (local — nearly instant)
         market_context = get_market_data_answer(ticker_symbol)
         
-        # Step 3: Solve using text
+        # Step 3: Answer the question
         if market_context:
             final_prompt = (
                 f"Official Exness Terminal Data:\n{market_context}\n\n"
                 f"Question: {question_text}\n\n"
-                "Based strictly on this official Exness terminal data, what is the exact numerical answer to the question? "
+                "Based strictly on this official Exness terminal data, what is the exact numerical answer? "
                 "Provide ONLY the final short number or answer (e.g., 4073.195), with zero explanation or text."
             )
         else:
@@ -121,13 +131,26 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
             )
 
         response = client_ai.models.generate_content(
-            model='gemini-3.5-flash',
+            model='gemini-2.5-flash',
             contents=[final_prompt]
         )
         return response.text.strip()
         
     except Exception as e:
-        return f"Error analyzing image: {e}"
+        print(f"❌ Error analyzing image: {e}")
+        return None
+
+def solve_question_text(question: str) -> str:
+    """Answers a plain text question — runs in a thread to avoid blocking event loop."""
+    try:
+        response = client_ai.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[f"Provide ONLY the direct answer to this question: {question}"]
+        )
+        return response.text.strip()
+    except Exception as e:
+        print(f"❌ Error answering text question: {e}")
+        return None
 
 @app.on_message(filters.chat(TARGET_CHAT) & (filters.photo | filters.text))
 async def handle_incoming_post(client: Client, message: Message):
@@ -135,33 +158,28 @@ async def handle_incoming_post(client: Client, message: Message):
 
     answer = ""
 
-    # Process photo entirely in memory (No disk write/delete delay)
     if message.photo:
         print("📸 Downloading photo to RAM...")
         try:
             photo_file = await client.download_media(message, in_memory=True)
             print("🔍 [SOLVING] Processing image and instant Exness data...")
-            # Run image solving in a separate thread to keep event loop fully responsive
+            # Run in thread — keeps event loop free for other incoming messages
             answer = await asyncio.to_thread(solve_question_image, photo_file)
             print(f"✅ [ANSWER GENERATED]: {answer}")
         except Exception as e:
             print(f"❌ Error handling photo: {e}")
 
-    # Process text
     elif message.text:
-        print(f"📝 Text Question Detected: {message.text[:50]}...")
+        print(f"📝 Text Question Detected: {message.text[:80]}...")
         try:
-            response = client_ai.models.generate_content(
-                model='gemini-3.5-flash',
-                contents=[f"Provide ONLY the direct answer to this question: {message.text}"]
-            )
-            answer = response.text.strip()
+            # Run in thread — was previously blocking the event loop
+            answer = await asyncio.to_thread(solve_question_text, message.text)
             print(f"✅ [ANSWER GENERATED]: {answer}")
         except Exception as e:
             print(f"Error: {e}")
 
-    # Send comment instantly into the discussion thread
-    if answer and "RESOURCE_EXHAUSTED" not in answer:
+    # Only post if we have a clean answer — never post errors
+    if answer and "RESOURCE_EXHAUSTED" not in answer and not answer.startswith("Error"):
         try:
             await client.send_message(
                 chat_id=message.chat.id,
@@ -172,11 +190,12 @@ async def handle_incoming_post(client: Client, message: Message):
         except Exception as e:
             print(f"❌ Error sending comment: {e}")
     else:
-        print("⚠️ Skipped posting due to API rate limit or error.")
+        print("⚠️ No valid answer — skipped posting.")
 
 if __name__ == "__main__":
     print("🤖 Initializing MT5 connection...")
     if mt5.initialize():
+        _mt5_initialized = True
         print("✅ MT5 Connected Successfully!")
     else:
         print(f"⚠️ MT5 Init Warning: {mt5.last_error()}")
