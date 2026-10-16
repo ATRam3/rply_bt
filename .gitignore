@@ -1,0 +1,14 @@
+# === Secrets — NEVER commit these ===
+.env
+
+# Pyrogram session files (contain your account auth token)
+*.session
+*.session-journal
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Downloads folder
+downloads/

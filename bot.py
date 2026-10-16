@@ -1,10 +1,14 @@
 import asyncio
 import sys
+import os
+from dotenv import load_dotenv
 
 # Fix Windows terminal encoding so emoji in print() never crashes
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
+# Load credentials from .env file
+load_dotenv()
 
 from io import BytesIO
 from pyrogram import Client, filters
@@ -14,13 +18,13 @@ from PIL import Image
 import MetaTrader5 as mt5
 import pandas as pd
 
-# 1. YOUR CREDENTIALS
-API_ID = TELEGRAM_API_ID_VALUE                          
-API_HASH = "TELEGRAM_API_HASH_VALUE" 
-GEMINI_API_KEY = "GEMINI_KEY_VALUE" 
+# 1. YOUR CREDENTIALS (loaded from .env)
+API_ID = int(os.getenv("TELEGRAM_API_ID"))
+API_HASH = os.getenv("TELEGRAM_API_HASH")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# 2. TARGET CHANNEL
-TARGET_CHAT = -1002044038089           
+# 2. TARGET CHANNEL (loaded from .env)
+TARGET_CHAT = int(os.getenv("TARGET_CHAT"))
 
 # Initialize Google GenAI Client
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
