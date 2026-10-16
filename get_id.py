@@ -1,15 +1,37 @@
 from pyrogram import Client
 
-# Put your sister's real credentials here
-API_ID = TELEGRAM_API_ID_VALUE                          # Replace with your Telegram API ID
-API_HASH = "TELEGRAM_API_HASH_VALUE"    
+API_ID = TELEGRAM_API_ID_VALUE
+API_HASH = "TELEGRAM_API_HASH_VALUE"
 
 app = Client("sister_bot", api_id=API_ID, api_hash=API_HASH)
 
 async def main():
-    async with app:
-        # Prints out all chats your sister's account is currently in
-        async for dialog in app.get_dialogs():
-            print(f"Chat Name: {dialog.chat.title} ---> ID: {dialog.chat.id}")
+    search = input("🔍 Enter channel name or @username to search: ").strip().lower()
 
-app.run(main())
+    async with app:
+        # Try direct username lookup first (fast)
+        if search.startswith("@") or not search.startswith("-"):
+            try:
+                chat = await app.get_chat(search.lstrip("@"))
+                print(f"\n✅ Found: {chat.title or chat.first_name}")
+                print(f"   ID: {chat.id}")
+                return
+            except Exception:
+                pass  # Fall back to dialog search below
+
+        # Search through all dialogs by name
+        print("🔎 Searching your dialogs...")
+        matches = []
+        async for dialog in app.get_dialogs():
+            name = dialog.chat.title or dialog.chat.first_name or ""
+            if search in name.lower():
+                matches.append((name, dialog.chat.id))
+
+        if matches:
+            print(f"\n✅ Found {len(matches)} match(es):\n")
+            for name, chat_id in matches:
+                print(f"   📌 {name}  -->  ID: {chat_id}")
+        else:
+            print(f"\n⚠️ No chats found matching '{search}'.")
+
+app.run(main())

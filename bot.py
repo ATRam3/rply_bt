@@ -20,7 +20,7 @@ API_HASH = "TELEGRAM_API_HASH_VALUE"
 GEMINI_API_KEY = "GEMINI_KEY_VALUE" 
 
 # 2. TARGET CHANNEL
-TARGET_CHAT = -1002385736403               
+TARGET_CHAT = -1002044038089           
 
 # Initialize Google GenAI Client
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
