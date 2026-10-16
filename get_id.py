@@ -1,7 +1,10 @@
+import os
+from dotenv import load_dotenv
 from pyrogram import Client
 
-API_ID = TELEGRAM_API_ID_VALUE
-API_HASH = "TELEGRAM_API_HASH_VALUE"
+load_dotenv()
+API_ID = int(os.getenv("TELEGRAM_API_ID"))
+API_HASH = os.getenv("TELEGRAM_API_HASH")
 
 app = Client("sister_bot", api_id=API_ID, api_hash=API_HASH)
 
