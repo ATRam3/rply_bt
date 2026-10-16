@@ -4,13 +4,13 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 import google.genai as genai
 from PIL import Image
-import requests
+import MetaTrader5 as mt5
+import pandas as pd
 
 # 1. YOUR CREDENTIALS
 API_ID = TELEGRAM_API_ID_VALUE                          # Your Telegram API ID
 API_HASH = "TELEGRAM_API_HASH_VALUE" # Your Telegram API Hash
 GEMINI_API_KEY = "GEMINI_KEY_VALUE" # Your Gemini API Key
-TWELVE_DATA_API_KEY = "TWELVE_DATA_KEY_VALUE" # Your Twelve Data API Key
 
 # 2. TARGET CHANNEL
 TARGET_CHAT = -1002385736403               # Your target chat numeric ID
@@ -22,54 +22,59 @@ client_ai = genai.Client(api_key=GEMINI_API_KEY)
 app = Client("fast_image_userbot", api_id=API_ID, api_hash=API_HASH)
 
 def get_market_data_answer(ticker_symbol: str) -> str:
-    """Fetches accurate institutional spot market data using the Twelve Data API."""
+    """Fetches exact spot market data directly from the logged-in Exness MT5 Terminal using the .m suffix."""
     try:
-        clean_symbol = ticker_symbol.strip().upper().replace("=", "").replace("-", "").replace("/", "")
+        clean_symbol = ticker_symbol.strip().upper().replace("/", "").replace("=", "").replace("-", "").replace(" ", "")
         
-        # Format symbol for Twelve Data spot format (e.g. XAU/USD, EUR/USD)
-        if clean_symbol in ["XAUUSD", "GOLD"]:
-            query_symbol = "XAU/USD"
-        elif clean_symbol in ["XAGUSD", "SILVER"]:
-            query_symbol = "XAG/USD"
-        elif clean_symbol == "BTCUSD":
-            query_symbol = "BTC/USD"
-        elif clean_symbol == "ETHUSD":
-            query_symbol = "ETH/USD"
-        elif len(clean_symbol) == 6 and clean_symbol.isalpha():
-            query_symbol = f"{clean_symbol[:3]}/{clean_symbol[3:]}"
+        # Map common names to Exness specific .m tickers
+        if clean_symbol in ["GOLD", "XAUUSD"]:
+            mt5_symbol = "XAUUSDm"
+        elif clean_symbol in ["SILVER", "XAGUSD"]:
+            mt5_symbol = "XAGUSDm"
+        elif clean_symbol in ["BTCUSD", "BTC"]:
+            mt5_symbol = "BTCUSDm"
+        elif clean_symbol in ["ETHUSD", "ETH"]:
+            mt5_symbol = "ETHUSDm"
         else:
-            query_symbol = clean_symbol
+            # Automatically append 'm' suffix for standard forex pairs if not already present
+            if not clean_symbol.endswith("M"):
+                mt5_symbol = clean_symbol + "m"
+            else:
+                mt5_symbol = clean_symbol
 
-        url = f"https://api.twelvedata.com/time_series?symbol={query_symbol}&interval=1day&outputsize=7&apikey={TWELVE_DATA_API_KEY}"
-        print(f"📊 [FETCHING TWELVE DATA FOR]: {query_symbol}")
+        # Initialize MT5 session
+        if not mt5.initialize():
+            print(f"❌ MT5 initialization failed: {mt5.last_error()}")
+            return None
+
+        # Make sure symbol is selected in Market Watch
+        mt5.symbol_select(mt5_symbol, True)
         
-        response = requests.get(url)
-        data = response.json()
-        
-        if "values" in data:
-            values = data["values"]
-            lows = [float(item["low"]) for item in values]
-            highs = [float(item["high"]) for item in values]
-            closes = [float(item["close"]) for item in values]
-            
-            lowest_price = min(lows)
-            highest_price = max(highs)
-            current_price = closes[0]
-            
+        # Request 7 Daily bars directly from Exness
+        rates = mt5.copy_rates_from_pos(mt5_symbol, mt5.TIMEFRAME_D1, 0, 7)
+        mt5.shutdown() # Close connection after reading
+
+        if rates is not None and len(rates) > 0:
+            df = pd.DataFrame(rates)
+            lowest_price = df['low'].min()
+            highest_price = df['high'].max()
+            current_price = df['close'].iloc[-1]
+
+            print(f"📊 [EXNESS DIRECT FEED] {mt5_symbol} | Low: {lowest_price:.3f}")
             return (
-                f"Live Spot Market Data for {query_symbol}:\n"
+                f"Official Exness Terminal Data for {mt5_symbol}:\n"
                 f"- Lowest price this week: {lowest_price:.3f}\n"
                 f"- Highest price this week: {highest_price:.3f}\n"
                 f"- Current price: {current_price:.3f}"
             )
         else:
-            print(f"⚠️ Twelve Data API message: {data.get('message', data)}")
+            print(f"⚠️ Symbol '{mt5_symbol}' not found in Exness Market Watch.")
     except Exception as e:
-        print(f"❌ Twelve Data fetch error for {ticker_symbol}: {e}")
+        print(f"❌ MT5 Fetch Error for {ticker_symbol}: {e}")
     return None
 
 def solve_question_image(image_path: str) -> str:
-    """Extracts ticker & question from image, pulls live Twelve Data spot feeds, and solves it."""
+    """Extracts ticker & question from image, pulls exact Exness prices, and solves it."""
     try:
         img = Image.open(image_path)
         
@@ -81,7 +86,7 @@ def solve_question_image(image_path: str) -> str:
             "Output strictly in this format: TICKER: <symbol> | QUESTION: <question text>"
         )
         query_response = client_ai.models.generate_content(
-            model='gemini-3.5-flash-lite',
+            model='gemini-3.5-flash',
             contents=[extract_prompt, img]
         )
         extracted_text = query_response.text.strip()
@@ -98,16 +103,16 @@ def solve_question_image(image_path: str) -> str:
                 elif "QUESTION:" in part:
                     question_text = part.replace("QUESTION:", "").strip()
 
-        # Step 2: Fetch live spot market data from Twelve Data
+        # Step 2: Fetch exact live data from local Exness MT5 app
         market_context = get_market_data_answer(ticker_symbol)
         
-        # Step 3: Solve using text ONLY (passing spot numbers + question)
+        # Step 3: Solve using text ONLY (passing exact Exness numbers + question)
         if market_context:
             final_prompt = (
-                f"Official Market Context (Twelve Data): {market_context}\n\n"
+                f"Official Exness Terminal Data:\n{market_context}\n\n"
                 f"Question: {question_text}\n\n"
-                "Note: The question refers to the Exness terminal chart. "
-                "Using the provided market low as a primary reference, output ONLY the exact numerical figure."
+                "Based strictly on this official Exness terminal data, what is the exact numerical answer to the question? "
+                "Provide ONLY the final short number or answer (e.g., 4073.195), with zero explanation or text."
             )
         else:
             final_prompt = (
@@ -116,7 +121,7 @@ def solve_question_image(image_path: str) -> str:
             )
 
         response = client_ai.models.generate_content(
-            model='gemini-3.5-flash-lite',
+            model='gemini-3.5-flash',
             contents=[final_prompt]
         )
         return response.text.strip()
@@ -136,7 +141,7 @@ async def handle_incoming_post(client: Client, message: Message):
         print("📸 Downloading photo...")
         file_path = await message.download()
         try:
-            print("🔍 [SOLVING] Processing image and Twelve Data spot feeds...")
+            print("🔍 [SOLVING] Processing image and local Exness terminal feeds...")
             answer = solve_question_image(file_path)
             print(f"✅ [ANSWER GENERATED]: {answer}")
         finally:
@@ -148,7 +153,7 @@ async def handle_incoming_post(client: Client, message: Message):
         print(f"📝 Text Question Detected: {message.text[:50]}...")
         try:
             response = client_ai.models.generate_content(
-                model='gemini-3.5-flash-lite',
+                model='gemini-3.5-flash',
                 contents=[f"Provide ONLY the direct answer to this question: {message.text}"]
             )
             answer = response.text.strip()
@@ -171,5 +176,5 @@ async def handle_incoming_post(client: Client, message: Message):
         print("⚠️ Skipped posting due to API rate limit or error.")
 
 if __name__ == "__main__":
-    print(f"🤖 Userbot listening on {TARGET_CHAT} for comments...")
+    print(f"🤖 Userbot listening on {TARGET_CHAT} with direct Exness MT5 bridge...")
     app.run()
