@@ -3,7 +3,7 @@ import sys
 import os
 from dotenv import load_dotenv
 
-# Fix Windows terminal encoding so emoji in print() never crashes
+# Fix Windows terminal encoding so emojis in print() never crash
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
@@ -18,7 +18,7 @@ from PIL import Image
 import MetaTrader5 as mt5
 import pandas as pd
 
-# 1. YOUR CREDENTIALS (loaded from .env)
+# 1. CREDENTIALS (loaded from .env)
 API_ID = int(os.getenv("TELEGRAM_API_ID"))
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -32,7 +32,7 @@ client_ai = genai.Client(api_key=GEMINI_API_KEY)
 # Initialize Telegram Userbot Session
 app = Client("fast_image_userbot", api_id=API_ID, api_hash=API_HASH)
 
-# Cache MT5 init state — avoids slow terminal_info() check on every message
+# Cache MT5 init state — avoids slow terminal checks on every message
 _mt5_initialized = False
 
 def ensure_mt5() -> bool:
@@ -47,7 +47,7 @@ def get_market_data_answer(ticker_symbol: str) -> str:
     try:
         clean_symbol = ticker_symbol.strip().upper().replace("/", "").replace("=", "").replace("-", "").replace(" ", "")
         
-        # O(1) dict lookup instead of sequential if/elif
+        # O(1) dict lookup for Exness specific .m tickers
         symbol_map = {
             "GOLD": "XAUUSDm", "XAUUSD": "XAUUSDm",
             "SILVER": "XAGUSDm", "XAGUSD": "XAGUSDm",
@@ -100,7 +100,7 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
             "Output strictly in this format: TICKER: <symbol> | QUESTION: <question text>"
         )
         query_response = client_ai.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.5-flash',
             contents=[extract_prompt, img]
         )
         extracted_text = query_response.text.strip()
@@ -135,7 +135,7 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
             )
 
         response = client_ai.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.5-flash',
             contents=[final_prompt]
         )
         return response.text.strip()
@@ -144,45 +144,26 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
         print(f"❌ Error analyzing image: {e}")
         return None
 
-def solve_question_text(question: str) -> str:
-    """Answers a plain text question — runs in a thread to avoid blocking event loop."""
-    try:
-        response = client_ai.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[f"Provide ONLY the direct answer to this question: {question}"]
-        )
-        return response.text.strip()
-    except Exception as e:
-        print(f"❌ Error answering text question: {e}")
-        return None
-
-@app.on_message(filters.chat(TARGET_CHAT) & (filters.photo | filters.text))
+# ==========================================
+# LISTEN STRICTLY FOR IMAGES ONLY IN TARGET CHAT
+# ==========================================
+@app.on_message(filters.chat(TARGET_CHAT) & filters.photo)
 async def handle_incoming_post(client: Client, message: Message):
-    print(f"\n⚡ [NEW POST DETECTED - ID: {message.id}] Processing...")
+    print(f"\n⚡ [NEW IMAGE POST DETECTED - ID: {message.id}] Processing...")
 
     answer = ""
+    print("📸 Downloading photo to RAM...")
+    try:
+        photo_file = await client.download_media(message, in_memory=True)
+        print("🔍 [SOLVING] Processing image and instant Exness data...")
+        
+        # Run in thread — keeps the main Telegram event loop free
+        answer = await asyncio.to_thread(solve_question_image, photo_file)
+        print(f"✅ [ANSWER GENERATED]: {answer}")
+    except Exception as e:
+        print(f"❌ Error handling photo: {e}")
 
-    if message.photo:
-        print("📸 Downloading photo to RAM...")
-        try:
-            photo_file = await client.download_media(message, in_memory=True)
-            print("🔍 [SOLVING] Processing image and instant Exness data...")
-            # Run in thread — keeps event loop free for other incoming messages
-            answer = await asyncio.to_thread(solve_question_image, photo_file)
-            print(f"✅ [ANSWER GENERATED]: {answer}")
-        except Exception as e:
-            print(f"❌ Error handling photo: {e}")
-
-    elif message.text:
-        print(f"📝 Text Question Detected: {message.text[:80]}...")
-        try:
-            # Run in thread — was previously blocking the event loop
-            answer = await asyncio.to_thread(solve_question_text, message.text)
-            print(f"✅ [ANSWER GENERATED]: {answer}")
-        except Exception as e:
-            print(f"Error: {e}")
-
-    # Only post if we have a clean answer — never post errors
+    # Only post if we have a valid clean answer
     if answer and "RESOURCE_EXHAUSTED" not in answer and not answer.startswith("Error"):
         try:
             await client.send_message(
@@ -204,7 +185,7 @@ if __name__ == "__main__":
     else:
         print(f"⚠️ MT5 Init Warning: {mt5.last_error()}")
 
-    print(f"🤖 Userbot listening on {TARGET_CHAT} with high-speed performance config...")
+    print(f"🤖 Userbot listening strictly for images on {TARGET_CHAT}...")
     app.run()
     
     # Clean shutdown on exit
