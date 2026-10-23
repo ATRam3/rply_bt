@@ -1,6 +1,8 @@
 import asyncio
 import sys
 import os
+import re
+import time
 from dotenv import load_dotenv
 
 # Fix Windows terminal encoding so emojis in print() never crash
@@ -32,161 +34,315 @@ client_ai = genai.Client(api_key=GEMINI_API_KEY)
 # Initialize Telegram Userbot Session
 app = Client("fast_image_userbot", api_id=API_ID, api_hash=API_HASH)
 
-# Cache MT5 init state — avoids slow terminal checks on every message
+# ── MT5 State ──
 _mt5_initialized = False
 
-def ensure_mt5() -> bool:
-    """Returns True if MT5 is ready, using a cached flag for speed."""
+# ── Pre-warmed symbol cache: mt5_symbol -> (timestamp, data_string) ──
+_symbol_cache: dict[str, tuple[float, str]] = {}
+_CACHE_TTL = 120  # 2 minutes — daily candles barely change
+
+
+# ── Expanded Exness symbol map (includes common aliases for indices) ──
+SYMBOL_MAP = {
+    "GOLD": "XAUUSDm", "XAUUSD": "XAUUSDm",
+    "SILVER": "XAGUSDm", "XAGUSD": "XAGUSDm",
+    "BTCUSD": "BTCUSDm", "BTC": "BTCUSDm", "BITCOIN": "BTCUSDm",
+    "ETHUSD": "ETHUSDm", "ETH": "ETHUSDm", "ETHEREUM": "ETHUSDm",
+    "EURUSD": "EURUSDm", "GBPUSD": "GBPUSDm",
+    "USDJPY": "USDJPYm", "GBPJPY": "GBPJPYm",
+    "EURJPY": "EURJPYm", "AUDUSD": "AUDUSDm",
+    "USDCAD": "USDCADm", "USDCHF": "USDCHFm",
+    "NZDUSD": "NZDUSDm", "EURGBP": "EURGBPm",
+    "EURAUD": "EURAUDm", "GBPAUD": "GBPAUDm",
+    "AUDCAD": "AUDCADm", "AUDJPY": "AUDJPYm",
+    "CADJPY": "CADJPYm", "CHFJPY": "CHFJPYm",
+    "NZDJPY": "NZDJPYm", "GBPCAD": "GBPCADm",
+    "GBPCHF": "GBPCHFm", "EURNZD": "EURNZDm",
+    "EURCHF": "EURCHFm", "EURCAD": "EURCADm",
+    "AUDNZD": "AUDNZDm", "AUDCHF": "AUDCHFm",
+    "CADCHF": "CADCHFm", "NZDCAD": "NZDCADm",
+    "NZDCHF": "NZDCHFm", "GBPNZD": "GBPNZDm",
+    # Indices — many aliases because Gemini says "S&P 500" or "Dow Jones"
+    "US30": "US30m", "DJ30": "US30m", "DOW": "US30m", "DOWJONES": "US30m",
+    "US500": "US500m", "SP500": "US500m", "SPX": "US500m", "SPX500": "US500m",
+    "USTEC": "USTECm", "NAS100": "USTECm", "NASDAQ": "USTECm", "NASDAQ100": "USTECm", "NSDQ": "USTECm",
+    "DE30": "DE30m", "DAX": "DE30m", "DE40": "DE40m",
+    "UK100": "UK100m", "FTSE": "UK100m",
+    "JP225": "JP225m", "NIKKEI": "JP225m",
+    "FR40": "FR40m", "HK50": "HK50m",
+}
+
+# Reverse lookup: "XAUUSDm" -> "XAUUSD" (for display)
+_MT5_TO_TICKER = {}
+for _k, _v in SYMBOL_MAP.items():
+    if _v not in _MT5_TO_TICKER:
+        _MT5_TO_TICKER[_v] = _k
+
+
+def ensure_mt5(force_retry: bool = False) -> bool:
+    """Returns True if MT5 is ready. If force_retry, resets cached state."""
     global _mt5_initialized
+    if force_retry:
+        _mt5_initialized = False
     if not _mt5_initialized:
         _mt5_initialized = mt5.initialize()
     return _mt5_initialized
 
-def get_market_data_answer(ticker_symbol: str) -> str:
-    """Fetches exact daily candles instantly using the persistent MT5 connection."""
+
+def _fetch_mt5_symbol(mt5_symbol: str) -> str | None:
+    """Raw MT5 fetch for a single symbol. Returns formatted string or None."""
+    mt5.symbol_select(mt5_symbol, True)
+    rates = mt5.copy_rates_from_pos(mt5_symbol, mt5.TIMEFRAME_D1, 0, 14)
+
+    if rates is None or len(rates) == 0:
+        return None
+
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+
+    # Use full clear labels so Gemini can reliably identify Open/Low/High/Close
+    price_records = [
+        f"{row['time'].strftime('%Y-%m-%d')} | Open: {row['open']} | Low: {row['low']} | High: {row['high']} | Close: {row['close']}"
+        for _, row in df.iterrows()
+    ]
+    period_low = df['low'].min()
+    period_high = df['high'].max()
+    latest_close = df['close'].iloc[-1]
+
+    return (
+        f"[{mt5_symbol}] Last 14 daily candles:\n" +
+        "\n".join(price_records) +
+        f"\n\n>>> ANSWER KEY <<<\n"
+        f"Lowest Price in the entire period: {period_low}\n"
+        f"Highest Price in the entire period: {period_high}\n"
+        f"Latest Close Price: {latest_close}"
+    )
+
+
+def get_market_data(ticker_symbol: str) -> str | None:
+    """Fetch daily candles for a ticker. Uses cache, auto-retries MT5 on failure."""
     try:
-        clean_symbol = ticker_symbol.strip().upper().replace("/", "").replace("=", "").replace("-", "").replace(" ", "")
-        
-        # O(1) dict lookup for Exness specific .m tickers
-        symbol_map = {
-            "GOLD": "XAUUSDm", "XAUUSD": "XAUUSDm",
-            "SILVER": "XAGUSDm", "XAGUSD": "XAGUSDm",
-            "BTCUSD": "BTCUSDm", "BTC": "BTCUSDm",
-            "ETHUSD": "ETHUSDm", "ETH": "ETHUSDm",
-        }
-        mt5_symbol = symbol_map.get(clean_symbol, clean_symbol if clean_symbol.endswith("M") else clean_symbol + "m")
+        clean = ticker_symbol.strip().upper().replace("/", "").replace("=", "").replace("-", "").replace(" ", "")
+        mt5_symbol = SYMBOL_MAP.get(clean, clean if clean.endswith("M") else clean + "m")
+
+        # Cache check
+        cached = _symbol_cache.get(mt5_symbol)
+        if cached and (time.time() - cached[0]) < _CACHE_TTL:
+            return cached[1]
 
         if not ensure_mt5():
-            print("❌ MT5 not available.")
-            return None
+            # One retry in case connection went stale
+            if not ensure_mt5(force_retry=True):
+                print(f"❌ MT5 unavailable: {mt5.last_error()}")
+                return None
 
-        mt5.symbol_select(mt5_symbol, True)
-        rates = mt5.copy_rates_from_pos(mt5_symbol, mt5.TIMEFRAME_D1, 0, 14)
-
-        if rates is not None and len(rates) > 0:
-            df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-
-            price_records = [
-                f"Date: {row['time'].strftime('%Y-%m-%d')} | Low: {row['low']:.3f} | High: {row['high']:.3f} | Close: {row['close']:.3f}"
-                for _, row in df.iterrows()
-            ]
-            absolute_low = df['low'].min()
-            absolute_high = df['high'].max()
-
-            print(f"📊 [EXNESS INSTANT FEED] {mt5_symbol} fetched successfully.")
-            return (
-                f"Official Exness Daily Candles for {mt5_symbol} (Last 14 Days):\n" +
-                "\n".join(price_records) +
-                f"\n\nAbsolute Lowest Price in Period: {absolute_low:.3f}\n"
-                f"Absolute Highest Price in Period: {absolute_high:.3f}"
-            )
+        data = _fetch_mt5_symbol(mt5_symbol)
+        if data:
+            _symbol_cache[mt5_symbol] = (time.time(), data)
+            return data
         else:
-            print(f"⚠️ Symbol '{mt5_symbol}' not found in Market Watch.")
+            print(f"⚠️ Symbol '{mt5_symbol}' not in Market Watch.")
     except Exception as e:
-        print(f"❌ MT5 Fetch Error for {ticker_symbol}: {e}")
+        print(f"❌ MT5 error for {ticker_symbol}: {e}")
     return None
 
-def solve_question_image(photo_bytes: BytesIO) -> str:
-    """Processes image from memory, fetches MT5 data, and queries Gemini."""
-    try:
-        img = Image.open(photo_bytes)
-        
-        # Step 1: Extract ticker + question from image
-        extract_prompt = (
-            "Analyze this trading quiz image. "
-            "1. Identify the asset symbol/ticker being asked about (e.g., EURUSD, XAUUSD, BTCUSD). "
-            "2. Identify the exact question text. "
-            "Output strictly in this format: TICKER: <symbol> | QUESTION: <question text>"
-        )
-        query_response = client_ai.models.generate_content(
-            model='gemini-3.5-flash',
-            contents=[extract_prompt, img]
-        )
-        extracted_text = query_response.text.strip()
-        print(f"🔎 [EXTRACTED DATA]: {extracted_text}")
-        
-        ticker_symbol = "XAUUSD"
-        question_text = extracted_text
-        
-        if "|" in extracted_text:
-            parts = extracted_text.split("|")
-            for part in parts:
-                if "TICKER:" in part:
-                    ticker_symbol = part.replace("TICKER:", "").strip()
-                elif "QUESTION:" in part:
-                    question_text = part.replace("QUESTION:", "").strip()
 
-        # Step 2: Fetch live MT5 data (local — nearly instant)
-        market_context = get_market_data_answer(ticker_symbol)
-        
-        # Step 3: Answer the question
-        if market_context:
-            final_prompt = (
-                f"Official Exness Terminal Data:\n{market_context}\n\n"
-                f"Question: {question_text}\n\n"
-                "Based strictly on this official Exness terminal data, what is the exact numerical answer? "
-                "Provide ONLY the final short number or answer (e.g., 4073.195), with zero explanation or text."
+def _pre_warm_cache():
+    """Pre-fetch popular symbols at startup so first requests hit cache."""
+    if not ensure_mt5():
+        return
+    for sym in ["XAUUSDm", "GBPJPYm", "EURUSDm", "BTCUSDm", "GBPUSDm", "USDJPYm",
+                 "EURJPYm", "AUDUSDm", "USDCADm", "USDCHFm",
+                 "US30m", "US500m", "USTECm", "GBPCHFm", "NZDUSDm"]:
+        data = _fetch_mt5_symbol(sym)
+        if data:
+            _symbol_cache[sym] = (time.time(), data)
+            print(f"  ✅ Cached {sym}")
+
+
+def _resize_image(img: Image.Image, max_side: int = 768) -> Image.Image:
+    """Downsample large images so Gemini upload is faster. Quality stays fine for text."""
+    w, h = img.size
+    if max(w, h) <= max_side:
+        return img
+    ratio = max_side / max(w, h)
+    return img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+
+
+def _clean_answer(raw: str) -> str:
+    """Strip markdown formatting and filler from Gemini response."""
+    text = raw.strip()
+    # Remove markdown bold/italic
+    text = re.sub(r'\*+', '', text)
+    text = re.sub(r'_+', '', text)
+    # Remove common filler prefixes
+    for filler in ["The answer is ", "Answer: ", "answer: ", "Result: "]:
+        if text.lower().startswith(filler.lower()):
+            text = text[len(filler):]
+    return text.strip()
+
+
+def _extract_ticker_from_text(text: str) -> str | None:
+    """Try to find a known ticker in Gemini's response using pattern matching."""
+    # Strip everything except letters and digits for matching
+    clean = text.upper()
+    for ch in "/&. ,'\"#()":
+        clean = clean.replace(ch, "")
+    # Try exact known tickers first (longest first to match NASDAQ100 before NAS100)
+    known = sorted(SYMBOL_MAP.keys(), key=len, reverse=True)
+    for ticker in known:
+        if ticker in clean:
+            return ticker
+    # Fallback: 6-letter uppercase block that looks like a forex pair
+    match = re.search(r'[A-Z]{6}', clean)
+    if match:
+        return match.group(0)
+    # Fallback: alphanumeric block like US500, US30
+    match = re.search(r'[A-Z]{2}\d{2,3}', clean)
+    if match:
+        return match.group(0)
+    return None
+
+
+def solve_question_image(photo_bytes: BytesIO) -> str:
+    """ONE Gemini call approach: extract ticker from image, fetch MT5, answer — all fast."""
+    try:
+        photo_bytes.seek(0)
+        img = Image.open(photo_bytes)
+        img = _resize_image(img)
+
+        # ── Step 1: Extract ticker with fast model ──
+        t0 = time.time()
+        try:
+            extract_resp = client_ai.models.generate_content(
+                model='gemini-3.5-flash',
+                contents=[
+                    "What trading asset/ticker/symbol is shown in this image? "
+                    "Reply with ONLY the ticker like EURUSD, XAUUSD, GBPJPY, BTCUSD, US500, US30, NASDAQ. Nothing else.",
+                    img
+                ]
+            )
+            ticker = _extract_ticker_from_text(extract_resp.text) or "XAUUSD"
+        except Exception as e:
+            error_str = str(e)
+            if "PERMISSION_DENIED" in error_str or "403" in error_str:
+                print(f"❌ CRITICAL: Gemini API access denied. Check your API key and billing.")
+                print(f"   Error: {error_str}")
+                print(f"   Visit: https://aistudio.google.com/apikey")
+                return None
+            print(f"⚠️ Ticker extraction failed ({error_str}), defaulting to XAUUSD")
+            ticker = "XAUUSD"
+        print(f"🔎 [TICKER: {ticker} in {time.time()-t0:.1f}s]")
+
+        # ── Step 2: Fetch MT5 data (instant from cache usually) ──
+        t1 = time.time()
+        market_data = get_market_data(ticker)
+        dt_mt5 = time.time() - t1
+
+        # ── Step 3: Answer with full-power model + image ──
+        t2 = time.time()
+        if market_data:
+            prompt = (
+                "You are a trading quiz solver. Below is official Exness broker price data.\n\n"
+                f"{market_data}\n\n"
+                "INSTRUCTIONS:\n"
+                "1. Read the question in the image carefully\n"
+                "2. Find the answer using ONLY the data above\n"
+                "3. Reply with ONLY the answer (number with full decimal precision, or short text if not a number question)\n"
+                "4. Do NOT add any explanation, label, unit, or extra text\n"
+                "5. For 'lowest price' questions → look at the Low column across all dates, find the smallest value\n"
+                "6. For 'highest price' questions → look at the High column across all dates, find the largest value\n"
+                "7. The ANSWER KEY section above already has the period Lowest and Highest — use those directly if the question asks about the whole period\n"
+                "8. Pay attention to the exact date range asked in the question"
             )
         else:
-            final_prompt = (
-                f"Question: {question_text}\n"
-                "Provide ONLY the correct, direct answer clearly and concisely."
+            prompt = (
+                "Look at this trading quiz image. Read the question carefully.\n"
+                "Reply with ONLY the correct answer. No explanation."
             )
 
         response = client_ai.models.generate_content(
             model='gemini-3.5-flash',
-            contents=[final_prompt]
+            contents=[prompt, img]
         )
-        return response.text.strip()
-        
+        answer = _clean_answer(response.text)
+        dt_gemini = time.time() - t2
+
+        print(f"📊 MT5: {dt_mt5:.1f}s | 🤖 Gemini: {dt_gemini:.1f}s | 💬 Answer: {answer}")
+        return answer
+
     except Exception as e:
-        print(f"❌ Error analyzing image: {e}")
+        error_str = str(e)
+        print(f"❌ solve_question_image error: {error_str}")
+        
+        # Handle specific API errors
+        if "PERMISSION_DENIED" in error_str or "403" in error_str:
+            print("🚨 CRITICAL: Your Gemini API key has been denied access!")
+            print("   Solutions:")
+            print("   1. Get a new API key from: https://aistudio.google.com/apikey")
+            print("   2. Check billing status at: https://console.cloud.google.com/billing")
+            print("   3. Verify project quotas at: https://console.cloud.google.com/apis/dashboard")
+            return None
+        
+        # If rate limited, return None so we don't post garbage
+        if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str:
+            print("⏳ Rate limited — will skip this post.")
+            return None
+        
         return None
+
 
 # ==========================================
 # LISTEN STRICTLY FOR IMAGES ONLY IN TARGET CHAT
 # ==========================================
 @app.on_message(filters.chat(TARGET_CHAT) & filters.photo)
 async def handle_incoming_post(client: Client, message: Message):
-    print(f"\n⚡ [NEW IMAGE POST DETECTED - ID: {message.id}] Processing...")
+    t_start = time.time()
+    print(f"\n⚡ [IMAGE POST #{message.id}] Processing...")
 
-    answer = ""
-    print("📸 Downloading photo to RAM...")
+    answer = None
     try:
         photo_file = await client.download_media(message, in_memory=True)
-        print("🔍 [SOLVING] Processing image and instant Exness data...")
-        
-        # Run in thread — keeps the main Telegram event loop free
-        answer = await asyncio.to_thread(solve_question_image, photo_file)
-        print(f"✅ [ANSWER GENERATED]: {answer}")
-    except Exception as e:
-        print(f"❌ Error handling photo: {e}")
+        print(f"📸 Downloaded in {time.time()-t_start:.1f}s")
 
-    # Only post if we have a valid clean answer
-    if answer and "RESOURCE_EXHAUSTED" not in answer and not answer.startswith("Error"):
+        # Run blocking Gemini+MT5 work in a thread so Telegram stays responsive
+        answer = await asyncio.to_thread(solve_question_image, photo_file)
+    except Exception as e:
+        print(f"❌ Photo handling error: {e}")
+
+    if not answer:
+        print("⚠️ No answer — skipped.")
+        return
+
+    # Post reply with retry
+    for attempt in range(3):
         try:
             await client.send_message(
                 chat_id=message.chat.id,
                 text=answer,
                 reply_to_message_id=message.id
             )
-            print("🚀 [COMMENT PLACED INSTANTLY!]")
+            print(f"🚀 [REPLIED in {time.time()-t_start:.1f}s total]")
+            return
         except Exception as e:
-            print(f"❌ Error sending comment: {e}")
-    else:
-        print("⚠️ No valid answer — skipped posting.")
+            print(f"❌ Send attempt {attempt+1}/3 failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(1)
+
+    print("❌ All send attempts failed.")
+
 
 if __name__ == "__main__":
     print("🤖 Initializing MT5 connection...")
     if mt5.initialize():
         _mt5_initialized = True
-        print("✅ MT5 Connected Successfully!")
+        print("✅ MT5 Connected!")
+        print("📊 Pre-warming cache...")
+        _pre_warm_cache()
     else:
-        print(f"⚠️ MT5 Init Warning: {mt5.last_error()}")
+        print(f"⚠️ MT5 Warning: {mt5.last_error()}")
 
-    print(f"🤖 Userbot listening strictly for images on {TARGET_CHAT}...")
+    print(f"🤖 Listening for images on {TARGET_CHAT}...")
     app.run()
-    
-    # Clean shutdown on exit
+
     mt5.shutdown()
