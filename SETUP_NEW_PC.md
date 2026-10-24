@@ -4,10 +4,14 @@
 
 You need these installed on the new PC:
 
-### 1. **Python 3.10+**
+### 1. **Python 3.10 to 3.12** (NOT 3.13+!)
 Download from: https://www.python.org/downloads/
 
-**Important:** Check "Add Python to PATH" during installation!
+**⚠️ IMPORTANT:**
+- Python 3.15 is TOO NEW - MetaTrader5 doesn't support it yet
+- Use Python 3.10, 3.11, or 3.12 (recommended: 3.11)
+- Download link: https://www.python.org/downloads/release/python-3119/
+- Check "Add Python to PATH" during installation!
 
 ### 2. **MetaTrader 5 Terminal**
 Download from: https://www.metatrader5.com/en/download
