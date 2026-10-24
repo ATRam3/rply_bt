@@ -99,6 +99,7 @@ def _fetch_mt5_symbol(mt5_symbol: str) -> str | None:
 
     df = pd.DataFrame(rates)
     df['time'] = pd.to_datetime(df['time'], unit='s')
+    df['day_of_week'] = df['time'].dt.dayofweek  # Monday=0, Friday=4
 
     # Use full clear labels so Gemini can reliably identify Open/Low/High/Close
     price_records = [
@@ -108,14 +109,29 @@ def _fetch_mt5_symbol(mt5_symbol: str) -> str | None:
     period_low = df['low'].min()
     period_high = df['high'].max()
     latest_close = df['close'].iloc[-1]
+    
+    # Trading weeks (Monday=0 to Friday=4 only)
+    weekdays = df[df['day_of_week'] <= 4]
+    this_week = weekdays.tail(5) if len(weekdays) >= 5 else weekdays
+    last_week = weekdays.iloc[-10:-5] if len(weekdays) >= 10 else pd.DataFrame()
+    
+    this_week_low = this_week['low'].min() if len(this_week) > 0 else period_low
+    this_week_high = this_week['high'].max() if len(this_week) > 0 else period_high
+    
+    last_week_low = last_week['low'].min() if len(last_week) > 0 else period_low
+    last_week_high = last_week['high'].max() if len(last_week) > 0 else period_high
 
     return (
         f"[{mt5_symbol}] Last 14 daily candles:\n" +
         "\n".join(price_records) +
         f"\n\n>>> ANSWER KEY <<<\n"
-        f"Lowest Price in the entire period: {period_low}\n"
-        f"Highest Price in the entire period: {period_high}\n"
-        f"Latest Close Price: {latest_close}"
+        f"Entire Period Lowest: {period_low}\n"
+        f"Entire Period Highest: {period_high}\n"
+        f"Latest Close: {latest_close}\n"
+        f"This Week (Mon-Fri) Lowest: {this_week_low}\n"
+        f"This Week (Mon-Fri) Highest: {this_week_high}\n"
+        f"Last Week (Mon-Fri) Lowest: {last_week_low}\n"
+        f"Last Week (Mon-Fri) Highest: {last_week_high}"
     )
 
 
@@ -205,70 +221,83 @@ def _extract_ticker_from_text(text: str) -> str | None:
 
 
 def solve_question_image(photo_bytes: BytesIO) -> str:
-    """ONE Gemini call approach: extract ticker from image, fetch MT5, answer — all fast."""
+    """Skip ticker detection, send top 3 tickers' data in one call."""
     try:
         photo_bytes.seek(0)
         img = Image.open(photo_bytes)
         img = _resize_image(img)
 
-        # ── Step 1: Extract ticker with fast model ──
         t0 = time.time()
-        try:
-            extract_resp = client_ai.models.generate_content(
-                model='gemini-3.5-flash',
-                contents=[
-                    "What trading asset/ticker/symbol is shown in this image? "
-                    "Reply with ONLY the ticker like EURUSD, XAUUSD, GBPJPY, BTCUSD, US500, US30, NASDAQ. Nothing else.",
-                    img
-                ]
-            )
-            ticker = _extract_ticker_from_text(extract_resp.text) or "XAUUSD"
-        except Exception as e:
-            error_str = str(e)
-            if "PERMISSION_DENIED" in error_str or "403" in error_str:
-                print(f"❌ CRITICAL: Gemini API access denied. Check your API key and billing.")
-                print(f"   Error: {error_str}")
-                print(f"   Visit: https://aistudio.google.com/apikey")
-                return None
-            print(f"⚠️ Ticker extraction failed ({error_str}), defaulting to XAUUSD")
-            ticker = "XAUUSD"
-        print(f"🔎 [TICKER: {ticker} in {time.time()-t0:.1f}s]")
-
-        # ── Step 2: Fetch MT5 data (instant from cache usually) ──
-        t1 = time.time()
-        market_data = get_market_data(ticker)
-        dt_mt5 = time.time() - t1
-
-        # ── Step 3: Answer with full-power model + image ──
-        t2 = time.time()
-        if market_data:
-            prompt = (
-                "You are a trading quiz solver. Below is official Exness broker price data.\n\n"
-                f"{market_data}\n\n"
-                "INSTRUCTIONS:\n"
-                "1. Read the question in the image carefully\n"
-                "2. Find the answer using ONLY the data above\n"
-                "3. Reply with ONLY the answer (number with full decimal precision, or short text if not a number question)\n"
-                "4. Do NOT add any explanation, label, unit, or extra text\n"
-                "5. For 'lowest price' questions → look at the Low column across all dates, find the smallest value\n"
-                "6. For 'highest price' questions → look at the High column across all dates, find the largest value\n"
-                "7. The ANSWER KEY section above already has the period Lowest and Highest — use those directly if the question asks about the whole period\n"
-                "8. Pay attention to the exact date range asked in the question"
-            )
-        else:
-            prompt = (
-                "Look at this trading quiz image. Read the question carefully.\n"
-                "Reply with ONLY the correct answer. No explanation."
-            )
+        
+        # Get top 16 tickers (covers 99%+ of questions)
+        # All commonly asked currencies + indices + commodities
+        top_tickers = [
+            "XAUUSD",   # Gold (most common)
+            "GBPJPY",   # Very common
+            "GBPUSD",   # Common
+            "EURUSD",   # Common
+            "USDJPY",   # Common
+            "BTCUSD",   # Bitcoin
+            "EURJPY",   # Common
+            "AUDUSD",   # Australian Dollar
+            "USDCAD",   # Canadian Dollar
+            "NZDUSD",   # New Zealand Dollar
+            "USDCHF",   # Swiss Franc
+            "GBPCHF",   # GBP/CHF
+            "NASDAQ",   # NASDAQ 100 Index
+            "US500",    # S&P 500 Index
+            "US30",     # Dow Jones Index
+            "XAGUSD"    # Silver
+        ]
+        combined_data = []
+        
+        for ticker in top_tickers:
+            data = get_market_data(ticker)
+            if data:
+                combined_data.append(f"\n{data}\n")
+        
+        all_data = "\n".join(combined_data)
+        
+        prompt = (
+            f"Trading data:\n{all_data}\n\n"
+            "Read the question in image. Find which symbol it's about. "
+            "Reply with ONLY the answer (number or text). "
+            "For 'last week' use Last Week values. For 'this week' use This Week values."
+        )
 
         response = client_ai.models.generate_content(
-            model='gemini-3.5-flash',
+            model='gemini-3.5-flash-lite',
             contents=[prompt, img]
         )
+        
         answer = _clean_answer(response.text)
-        dt_gemini = time.time() - t2
-
-        print(f"📊 MT5: {dt_mt5:.1f}s | 🤖 Gemini: {dt_gemini:.1f}s | 💬 Answer: {answer}")
+        
+        # Fallback: if answer indicates missing data, try to detect ticker and retry
+        if any(keyword in answer.lower() for keyword in ["not provided", "no data", "does not contain", "not available", "data for"]):
+            print("⚠️ Ticker not in top 7, using fallback...")
+            try:
+                small_img = _resize_image(img.copy(), max_side=384)
+                ticker_resp = client_ai.models.generate_content(
+                    model='gemini-3.5-flash-lite',
+                    contents=["What trading symbol? Reply ONLY: ticker name like AUDUSD, NASDAQ, etc.", small_img]
+                )
+                ticker = _extract_ticker_from_text(ticker_resp.text)
+                if ticker:
+                    print(f"🔎 Fallback detected: {ticker}")
+                    market_data = get_market_data(ticker)
+                    if market_data:
+                        retry_prompt = f"{market_data}\n\nQuestion in image. Reply with ONLY the answer. For 'last week' use Last Week values."
+                        retry_resp = client_ai.models.generate_content(
+                            model='gemini-3.5-flash-lite',
+                            contents=[retry_prompt, img]
+                        )
+                        answer = _clean_answer(retry_resp.text)
+                        print(f"✅ Fallback answer: {answer}")
+            except Exception as e:
+                print(f"❌ Fallback failed: {e}")
+        
+        total_time = time.time() - t0
+        print(f"⚡ Answered in {total_time:.1f}s | {answer}")
         return answer
 
     except Exception as e:
