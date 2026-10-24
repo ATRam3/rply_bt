@@ -1,0 +1,7 @@
+pyrogram==2.0.106
+TgCrypto==1.2.5
+google-genai==2.29.0
+Pillow==11.0.0
+MetaTrader5==5.0.4529
+pandas==3.0.6
+python-dotenv==1.2.4
