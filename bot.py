@@ -65,7 +65,7 @@ SYMBOL_MAP = {
     # Indices — many aliases because Gemini says "S&P 500" or "Dow Jones"
     "US30": "US30m", "DJ30": "US30m", "DOW": "US30m", "DOWJONES": "US30m",
     "US500": "US500m", "SP500": "US500m", "SPX": "US500m", "SPX500": "US500m",
-    "USTEC": "USTECm", "NAS100": "USTECm", "NASDAQ": "USTECm", "NASDAQ100": "USTECm", "NSDQ": "USTECm",
+    "USTEC": "USTECm", "NAS100": "USTECm", "NASDAQ": "USTECm", "NASDAQ100": "USTECm", "NSDQ": "USTECm", "USTECH100": "USTECm",
     "DE30": "DE30m", "DAX": "DE30m", "DE40": "DE40m",
     "UK100": "UK100m", "FTSE": "UK100m",
     "JP225": "JP225m", "NIKKEI": "JP225m",
@@ -221,7 +221,7 @@ def _extract_ticker_from_text(text: str) -> str | None:
 
 
 def solve_question_image(photo_bytes: BytesIO) -> str:
-    """Skip ticker detection, send top 3 tickers' data in one call."""
+    """ULTRA-FAST: Match question to pre-computed answers, no Gemini needed!"""
     try:
         photo_bytes.seek(0)
         img = Image.open(photo_bytes)
@@ -229,76 +229,111 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
 
         t0 = time.time()
         
-        # Get top 16 tickers (covers 99%+ of questions)
-        # All commonly asked currencies + indices + commodities
+        # Get all 16 tickers' data and build answer lookup
         top_tickers = [
-            "XAUUSD",   # Gold (most common)
-            "GBPJPY",   # Very common
-            "GBPUSD",   # Common
-            "EURUSD",   # Common
-            "USDJPY",   # Common
-            "BTCUSD",   # Bitcoin
-            "EURJPY",   # Common
-            "AUDUSD",   # Australian Dollar
-            "USDCAD",   # Canadian Dollar
-            "NZDUSD",   # New Zealand Dollar
-            "USDCHF",   # Swiss Franc
-            "GBPCHF",   # GBP/CHF
-            "NASDAQ",   # NASDAQ 100 Index
-            "US500",    # S&P 500 Index
-            "US30",     # Dow Jones Index
-            "XAGUSD"    # Silver
+            "XAUUSD", "GBPJPY", "GBPUSD", "EURUSD", "USDJPY", "BTCUSD",
+            "EURJPY", "AUDUSD", "USDCAD", "NZDUSD", "USDCHF", "GBPCHF",
+            "NASDAQ", "US500", "US30", "XAGUSD"
         ]
-        combined_data = []
         
+        # Build a complete answer database
+        answer_db = []
         for ticker in top_tickers:
             data = get_market_data(ticker)
-            if data:
-                combined_data.append(f"\n{data}\n")
+            if not data:
+                continue
+                
+            # Initialize variables
+            this_week_low = this_week_high = last_week_low = last_week_high = None
+            period_low = period_high = latest_close = None
+            
+            # Parse the data to extract key values
+            lines = data.split('\n')
+            for line in lines:
+                line = line.strip()
+                if 'This Week' in line and 'Lowest' in line:
+                    this_week_low = line.split(':')[-1].strip()
+                elif 'This Week' in line and 'Highest' in line:
+                    this_week_high = line.split(':')[-1].strip()
+                elif 'Last Week' in line and 'Lowest' in line:
+                    last_week_low = line.split(':')[-1].strip()
+                elif 'Last Week' in line and 'Highest' in line:
+                    last_week_high = line.split(':')[-1].strip()
+                elif 'Entire Period Lowest:' in line:
+                    period_low = line.split(':')[-1].strip()
+                elif 'Entire Period Highest:' in line:
+                    period_high = line.split(':')[-1].strip()
+                elif 'Latest Close:' in line:
+                    latest_close = line.split(':')[-1].strip()
+            
+            # Store all possible answers for this ticker
+            answer_db.append({
+                'ticker': ticker,
+                'this_week_low': this_week_low,
+                'this_week_high': this_week_high,
+                'last_week_low': last_week_low,
+                'last_week_high': last_week_high,
+                'period_low': period_low,
+                'period_high': period_high,
+                'latest_close': latest_close
+            })
         
-        all_data = "\n".join(combined_data)
+        print(f"📊 Pre-computed answers for {len(answer_db)} tickers")
         
+        # Now use Gemini ONLY to identify: ticker + question type
+        small_img = _resize_image(img.copy(), max_side=512)
         prompt = (
-            f"Trading data:\n{all_data}\n\n"
-            "Read the question in image. Find which symbol it's about. "
-            "Reply with ONLY the answer (number or text). "
-            "For 'last week' use Last Week values. For 'this week' use This Week values."
+            "Extract info from this trading quiz:\n"
+            "1. Which symbol? (e.g. XAUUSD, GBPJPY, NASDAQ)\n"
+            "2. What's asked? Reply in format: SYMBOL|TYPE\n"
+            "TYPE can be: THIS_WEEK_LOW, THIS_WEEK_HIGH, LAST_WEEK_LOW, LAST_WEEK_HIGH, PERIOD_LOW, PERIOD_HIGH, LATEST_CLOSE\n"
+            "Example: GBPJPY|LAST_WEEK_LOW"
         )
-
+        
         response = client_ai.models.generate_content(
             model='gemini-3.5-flash-lite',
-            contents=[prompt, img]
+            contents=[prompt, small_img]
         )
         
-        answer = _clean_answer(response.text)
+        # Parse Gemini response
+        result = response.text.strip().upper()
+        print(f"🔎 Gemini: {result}")
         
-        # Fallback: if answer indicates missing data, try to detect ticker and retry
-        if any(keyword in answer.lower() for keyword in ["not provided", "no data", "does not contain", "not available", "data for"]):
-            print("⚠️ Ticker not in top 7, using fallback...")
-            try:
-                small_img = _resize_image(img.copy(), max_side=384)
-                ticker_resp = client_ai.models.generate_content(
-                    model='gemini-3.5-flash-lite',
-                    contents=["What trading symbol? Reply ONLY: ticker name like AUDUSD, NASDAQ, etc.", small_img]
-                )
-                ticker = _extract_ticker_from_text(ticker_resp.text)
-                if ticker:
-                    print(f"🔎 Fallback detected: {ticker}")
-                    market_data = get_market_data(ticker)
-                    if market_data:
-                        retry_prompt = f"{market_data}\n\nQuestion in image. Reply with ONLY the answer. For 'last week' use Last Week values."
-                        retry_resp = client_ai.models.generate_content(
-                            model='gemini-3.5-flash-lite',
-                            contents=[retry_prompt, img]
-                        )
-                        answer = _clean_answer(retry_resp.text)
-                        print(f"✅ Fallback answer: {answer}")
-            except Exception as e:
-                print(f"❌ Fallback failed: {e}")
+        # Extract ticker and type
+        if '|' not in result:
+            print(f"⚠️ Gemini response format invalid - skipping")
+            return None
+            
+        ticker_asked, question_type = result.split('|', 1)
+        ticker_asked = ticker_asked.strip()
+        question_type = question_type.strip()
         
-        total_time = time.time() - t0
-        print(f"⚡ Answered in {total_time:.1f}s | {answer}")
-        return answer
+        # Find the answer in our pre-computed database
+        for entry in answer_db:
+            if entry['ticker'].upper() == ticker_asked or ticker_asked in entry['ticker'].upper():
+                    # Map question type to answer
+                    answer_map = {
+                        'THIS_WEEK_LOW': entry['this_week_low'],
+                        'THIS_WEEK_HIGH': entry['this_week_high'],
+                        'LAST_WEEK_LOW': entry['last_week_low'],
+                        'LAST_WEEK_HIGH': entry['last_week_high'],
+                        'PERIOD_LOW': entry['period_low'],
+                        'PERIOD_HIGH': entry['period_high'],
+                        'LATEST_CLOSE': entry['latest_close']
+                    }
+                    
+                    answer = answer_map.get(question_type, None)
+                    if answer:
+                        total_time = time.time() - t0
+                        print(f"⚡ Answered in {total_time:.1f}s | {answer}")
+                        return answer
+                    else:
+                        print(f"⚠️ Question type '{question_type}' not recognized - skipping")
+                        return None
+        
+        # If ticker not in pre-computed list, skip
+        print(f"⚠️ Ticker '{ticker_asked}' not in pre-loaded list - skipping")
+        return None
 
     except Exception as e:
         error_str = str(e)
