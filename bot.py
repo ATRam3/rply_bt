@@ -630,9 +630,9 @@ def solve_question_with_gemini(photo_bytes: BytesIO) -> str:
 # LISTEN TO BOTH CHANNEL AND CHAT GROUP
 # ==========================================
 
-# DEBUG LISTENER: Shows ALL messages from BOTH locations
+# DEBUG LISTENER: Shows messages from CHANNEL only (to avoid spam from chat)
 # group=0 runs FIRST, must call continue_propagation() to let photo handler run
-@app.on_message(filters.chat([TARGET_CHANNEL, TARGET_CHAT]), group=0)
+@app.on_message(filters.chat(TARGET_CHANNEL), group=0)
 async def debug_all_messages(client: Client, message: Message):
     msg_type = "📸 PHOTO" if message.photo else "💬 TEXT" if message.text else "📎 OTHER"
     sender = "?"
@@ -644,12 +644,66 @@ async def debug_all_messages(client: Client, message: Message):
     chat_name = "CHANNEL" if message.chat.id == TARGET_CHANNEL else "CHAT_GROUP"
     print(f"[{time.strftime('%H:%M:%S')}] {chat_name} | {msg_type} msg#{message.id} from={sender}")
     
-    # ⚡ CRITICAL: Let the photo handler also process this message!
+    # ⚡ CRITICAL: Let other handlers also process this message!
     message.continue_propagation()
 
-# PHOTO HANDLER: Processes images from BOTH channel and chat group
+
+# HYPE HANDLER: Auto-reply to quiz announcements
+# group=0.5 runs after debug, before photo handler
+@app.on_message(filters.chat(TARGET_CHANNEL) & filters.text, group=0)
+async def hype_quiz_announcements(client: Client, message: Message):
+    """Detect quiz announcements and post hype in chat group"""
+    import random
+    
+    text = message.text if message.text else ""
+    
+    # Keywords for quiz announcement (English + Amharic)
+    ready_keywords = [
+        "20$", "ዶላር", "ጥያቄ", "ደቂቃ", "ተዘጋጁ", "ይቀርባል",
+        "ready", "starts", "starting", "quiz time"
+    ]
+    
+    # Check if this is an announcement
+    is_announcement = any(keyword in text for keyword in ready_keywords)
+    
+    # Special check for 20$ + ዶላር combo
+    if "20$" in text and "ዶላር" in text:
+        is_announcement = True
+    
+    if is_announcement:
+        print(f"\n🎉 QUIZ ANNOUNCEMENT DETECTED!")
+        print(f"📝 Text: {text[:80]}...")
+        
+        # Hype messages
+        hype_messages = [
+            "Let's gooo! 🔥",
+            "LET'S GO! 💪",
+            "Ready! Let's goooo! 🚀",
+            "Let's go! Time to win! 🏆",
+            "LETS GOOOOO! 🔥🔥🔥",
+            "ተዘጋጅቻለሁ! 🔥",
+        ]
+        
+        # Wait 2-4 seconds (look natural)
+        wait_time = random.uniform(2, 4)
+        print(f"⏳ Waiting {wait_time:.1f}s before posting hype...")
+        await asyncio.sleep(wait_time)
+        
+        # Post hype in chat group
+        hype = random.choice(hype_messages)
+        try:
+            await client.send_message(TARGET_CHAT, hype)
+            print(f"✅ Posted hype: {hype}\n")
+        except Exception as e:
+            print(f"❌ Error posting hype: {e}")
+    
+    # Let photo handler process too
+    message.continue_propagation()
+
+
+# PHOTO HANDLER: Processes images from CHANNEL only (quiz origin)
 # group=1 runs AFTER debug handler
-@app.on_message(filters.chat([TARGET_CHANNEL, TARGET_CHAT]) & filters.photo, group=1)
+@app.on_message(filters.chat(TARGET_CHANNEL) & filters.photo, group=1)
 async def handle_incoming_post(client: Client, message: Message):
     t_start = time.time()
     
