@@ -25,8 +25,9 @@ API_ID = int(os.getenv("TELEGRAM_API_ID"))
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# 2. TARGET CHANNEL (loaded from .env)
-TARGET_CHAT = int(os.getenv("TARGET_CHAT"))
+# 2. TARGET CHANNELS (loaded from .env)
+TARGET_CHANNEL = int(os.getenv("TARGET_CHANNEL").strip())  # Main quiz channel
+TARGET_CHAT = int(os.getenv("TARGET_CHAT").strip())  # Discussion group
 
 # Initialize Google GenAI Client
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
