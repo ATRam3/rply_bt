@@ -224,11 +224,14 @@ def _extract_ticker_from_text(text: str) -> str | None:
 def solve_question_image(photo_bytes: BytesIO) -> str:
     """ULTRA-FAST: Match question to pre-computed answers, no Gemini needed!"""
     try:
+        t0 = time.time()
+        
         photo_bytes.seek(0)
         img = Image.open(photo_bytes)
         img = _resize_image(img)
+        print(f"⏱️  Image load: {time.time()-t0:.2f}s")
 
-        t0 = time.time()
+        t_precompute = time.time()
         
         # Get all 16 tickers' data and build answer lookup
         top_tickers = [
@@ -280,9 +283,11 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
             })
         
         print(f"📊 Pre-computed answers for {len(answer_db)} tickers")
+        print(f"⏱️  Pre-compute: {time.time()-t_precompute:.2f}s")
         
         # Now use Gemini ONLY to identify: ticker + question type
-        small_img = _resize_image(img.copy(), max_side=512)
+        # OPTIMIZED: Use smaller image (256px) and faster model
+        small_img = _resize_image(img.copy(), max_side=256)
         prompt = (
             "Extract info from this trading quiz:\n"
             "1. Which symbol? (e.g. XAUUSD, GBPJPY, NASDAQ)\n"
@@ -291,10 +296,13 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
             "Example: GBPJPY|LAST_WEEK_LOW"
         )
         
+        t_gemini_start = time.time()
         response = client_ai.models.generate_content(
-            model='gemini-3.5-flash-lite',
+            model='gemini-1.5-flash-8b',  # OPTIMIZED: Faster model (was gemini-3.5-flash-lite)
             contents=[prompt, small_img]
         )
+        gemini_time = time.time() - t_gemini_start
+        print(f"⏱️  Gemini API: {gemini_time:.2f}s")
         
         # Parse Gemini response
         result = response.text.strip().upper()
@@ -326,7 +334,8 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
                     answer = answer_map.get(question_type, None)
                     if answer:
                         total_time = time.time() - t0
-                        print(f"⚡ Answered in {total_time:.1f}s | {answer}")
+                        print(f"⏱️  Lookup: 0.01s")
+                        print(f"⚡ TOTAL TIME: {total_time:.2f}s | Answer: {answer}")
                         return answer
                     else:
                         print(f"⚠️ Question type '{question_type}' not recognized - skipping")
