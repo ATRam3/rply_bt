@@ -20,6 +20,27 @@ from PIL import Image
 import MetaTrader5 as mt5
 import pandas as pd
 
+# OCR for fast text extraction
+try:
+    import pytesseract
+    # Auto-detect Tesseract on Windows
+    import os
+    if os.name == 'nt':  # Windows
+        possible_paths = [
+            r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+            r'C:\Tesseract-OCR\tesseract.exe'
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                pytesseract.pytesseract.tesseract_cmd = path
+                break
+    OCR_AVAILABLE = True
+    print("✅ OCR Mode: Enabled (pytesseract)")
+except ImportError:
+    OCR_AVAILABLE = False
+    print("⚠️ OCR Mode: Disabled (pytesseract not installed)")
+
 # 1. CREDENTIALS (loaded from .env)
 API_ID = int(os.getenv("TELEGRAM_API_ID"))
 API_HASH = os.getenv("TELEGRAM_API_HASH")
@@ -222,7 +243,111 @@ def _extract_ticker_from_text(text: str) -> str | None:
 
 
 def solve_question_image(photo_bytes: BytesIO) -> str:
-    """ULTRA-FAST: Match question to pre-computed answers, no Gemini needed!"""
+    """Choose OCR or Gemini based on availability"""
+    if OCR_AVAILABLE:
+        return solve_question_with_ocr(photo_bytes)
+    else:
+        return solve_question_with_gemini(photo_bytes)
+
+
+def solve_question_with_ocr(photo_bytes: BytesIO) -> str:
+    """NUCLEAR OPTION: Use OCR instead of Gemini - 10x faster!"""
+    try:
+        t0 = time.time()
+        
+        photo_bytes.seek(0)
+        img = Image.open(photo_bytes)
+        
+        # Enhance image for better OCR
+        img = img.convert('L')  # Convert to grayscale
+        img = _resize_image(img, max_side=1024)  # Higher res for OCR
+        
+        print(f"⏱️  Image prep: {time.time()-t0:.2f}s")
+        
+        # Extract text using OCR (FAST: 0.1-0.3s)
+        t_ocr = time.time()
+        text = pytesseract.image_to_string(img, config='--psm 6').upper()
+        print(f"⏱️  OCR extract: {time.time()-t_ocr:.2f}s")
+        print(f"📝 Extracted text: {text[:200]}...")  # Show first 200 chars
+        
+        # Parse ticker from text
+        ticker = None
+        for known_ticker in ["XAUUSD", "GOLD", "GBPJPY", "GBPUSD", "EURUSD", "USDJPY", 
+                            "BTCUSD", "BITCOIN", "EURJPY", "AUDUSD", "USDCAD", "NZDUSD",
+                            "USDCHF", "GBPCHF", "NASDAQ", "US500", "US30", "XAGUSD", 
+                            "SILVER", "USOIL", "OIL", "CRUDE"]:
+            if known_ticker in text:
+                ticker = known_ticker
+                break
+        
+        if not ticker:
+            print("⚠️ No ticker found in text - falling back to Gemini")
+            return solve_question_with_gemini(photo_bytes)
+        
+        print(f"🎯 Ticker found: {ticker}")
+        
+        # Determine question type from text
+        question_type = None
+        text_lower = text.lower()
+        
+        if ("this week" in text_lower or "current week" in text_lower):
+            if ("highest" in text_lower or "high" in text_lower or "maximum" in text_lower):
+                question_type = "THIS_WEEK_HIGH"
+            elif ("lowest" in text_lower or "low" in text_lower or "minimum" in text_lower):
+                question_type = "THIS_WEEK_LOW"
+        elif ("last week" in text_lower or "previous week" in text_lower):
+            if ("highest" in text_lower or "high" in text_lower or "maximum" in text_lower):
+                question_type = "LAST_WEEK_HIGH"
+            elif ("lowest" in text_lower or "low" in text_lower or "minimum" in text_lower):
+                question_type = "LAST_WEEK_LOW"
+        elif ("close" in text_lower or "closing" in text_lower):
+            question_type = "LATEST_CLOSE"
+        
+        if not question_type:
+            print("⚠️ Question type unclear - falling back to Gemini")
+            return solve_question_with_gemini(photo_bytes)
+        
+        print(f"❓ Question type: {question_type}")
+        
+        # Fetch data for this ticker only
+        t_fetch = time.time()
+        data = get_market_data(ticker)
+        if not data:
+            return None
+        print(f"⏱️  MT5 fetch: {time.time()-t_fetch:.2f}s")
+        
+        # Parse answer from data
+        lines = data.split('\n')
+        answer = None
+        
+        for line in lines:
+            line = line.strip()
+            if question_type == "THIS_WEEK_LOW" and "This Week" in line and "Lowest" in line:
+                answer = line.split(':')[-1].strip()
+            elif question_type == "THIS_WEEK_HIGH" and "This Week" in line and "Highest" in line:
+                answer = line.split(':')[-1].strip()
+            elif question_type == "LAST_WEEK_LOW" and "Last Week" in line and "Lowest" in line:
+                answer = line.split(':')[-1].strip()
+            elif question_type == "LAST_WEEK_HIGH" and "Last Week" in line and "Highest" in line:
+                answer = line.split(':')[-1].strip()
+            elif question_type == "LATEST_CLOSE" and "Latest Close:" in line:
+                answer = line.split(':')[-1].strip()
+        
+        if answer:
+            total_time = time.time() - t0
+            print(f"⚡ OCR TOTAL TIME: {total_time:.2f}s | Answer: {answer}")
+            return answer
+        else:
+            print("⚠️ Answer not found - falling back to Gemini")
+            return solve_question_with_gemini(photo_bytes)
+            
+    except Exception as e:
+        print(f"❌ OCR error: {e} - falling back to Gemini")
+        return solve_question_with_gemini(photo_bytes)
+
+
+def solve_question_with_gemini(photo_bytes: BytesIO) -> str:
+    """Original Gemini-based solver (fallback)"""
     try:
         t0 = time.time()
         
