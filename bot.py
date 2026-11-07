@@ -361,8 +361,9 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
 # LISTEN TO BOTH CHANNEL AND CHAT GROUP
 # ==========================================
 
-# DEBUG LISTENER: Shows ALL messages from BOTH locations  
-@app.on_message(filters.chat([TARGET_CHANNEL, TARGET_CHAT]))
+# DEBUG LISTENER: Shows ALL messages from BOTH locations
+# group=0 runs FIRST, must call continue_propagation() to let photo handler run
+@app.on_message(filters.chat([TARGET_CHANNEL, TARGET_CHAT]), group=0)
 async def debug_all_messages(client: Client, message: Message):
     msg_type = "📸 PHOTO" if message.photo else "💬 TEXT" if message.text else "📎 OTHER"
     sender = "?"
@@ -373,9 +374,13 @@ async def debug_all_messages(client: Client, message: Message):
     
     chat_name = "CHANNEL" if message.chat.id == TARGET_CHANNEL else "CHAT_GROUP"
     print(f"[{time.strftime('%H:%M:%S')}] {chat_name} | {msg_type} msg#{message.id} from={sender}")
+    
+    # ⚡ CRITICAL: Let the photo handler also process this message!
+    message.continue_propagation()
 
 # PHOTO HANDLER: Processes images from BOTH channel and chat group
-@app.on_message(filters.chat([TARGET_CHANNEL, TARGET_CHAT]) & filters.photo)
+# group=1 runs AFTER debug handler
+@app.on_message(filters.chat([TARGET_CHANNEL, TARGET_CHAT]) & filters.photo, group=1)
 async def handle_incoming_post(client: Client, message: Message):
     t_start = time.time()
     
