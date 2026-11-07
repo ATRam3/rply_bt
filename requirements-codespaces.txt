@@ -1,0 +1,8 @@
+# Requirements for GitHub Codespaces (Linux - no MetaTrader5)
+pyrogram>=2.0.106
+TgCrypto>=1.2.5
+google-genai>=2.29.0
+Pillow>=10.0.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
+pytesseract>=0.3.10

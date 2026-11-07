@@ -3,7 +3,13 @@ import sys
 import os
 import re
 import time
+import json
+import logging
+from datetime import datetime
 from dotenv import load_dotenv
+
+# Suppress Pyrogram's "Peer id invalid" warnings - these are harmless background errors
+logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
 # Fix Windows terminal encoding so emojis in print() never crash
 if sys.stdout.encoding != 'utf-8':
@@ -17,8 +23,17 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 import google.genai as genai
 from PIL import Image
-import MetaTrader5 as mt5
 import pandas as pd
+
+# Try to import MT5 (only works on Windows)
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+    print("✅ MT5: Available (Windows)")
+except ImportError:
+    MT5_AVAILABLE = False
+    mt5 = None
+    print("⚠️ MT5: Not available (Linux/Mac - using JSON fallback)")
 
 # OCR for fast text extraction
 try:
@@ -100,10 +115,94 @@ for _k, _v in SYMBOL_MAP.items():
     if _v not in _MT5_TO_TICKER:
         _MT5_TO_TICKER[_v] = _k
 
+# ── JSON Price Data (for Codespaces/Linux where MT5 doesn't work) ──
+_json_prices = {}
+
+def load_json_prices():
+    """Load pre-generated prices from mt5_prices.json (for cloud deployment)"""
+    global _json_prices
+    json_file = "mt5_prices.json"
+    
+    if not os.path.exists(json_file):
+        return False
+    
+    try:
+        with open(json_file, 'r') as f:
+            data = json.load(f)
+        
+        print(f"📦 Loading prices from {json_file}")
+        print(f"   Generated: {data.get('generated_at', 'unknown')}")
+        
+        # Build cache from JSON data
+        for price_entry in data.get('prices', []):
+            symbol = price_entry['symbol']
+            timeframe = price_entry['timeframe']
+            bars = price_entry['bars']
+            
+            # Only load D1 timeframe (daily) data
+            if timeframe != 'D1':
+                continue
+            
+            # Convert to pandas DataFrame (same format as MT5)
+            df_data = []
+            for bar in bars:
+                df_data.append({
+                    'time': pd.to_datetime(bar['time']),
+                    'open': bar['open'],
+                    'high': bar['high'],
+                    'low': bar['low'],
+                    'close': bar['close']
+                })
+            
+            df = pd.DataFrame(df_data)
+            df['day_of_week'] = df['time'].dt.dayofweek
+            
+            # Calculate answer key (same logic as _fetch_mt5_symbol)
+            period_low = df['low'].min()
+            period_high = df['high'].max()
+            latest_close = df['close'].iloc[-1]
+            
+            weekdays = df[df['day_of_week'] <= 4]
+            this_week = weekdays.tail(5) if len(weekdays) >= 5 else weekdays
+            last_week = weekdays.iloc[-10:-5] if len(weekdays) >= 10 else pd.DataFrame()
+            
+            this_week_low = this_week['low'].min() if len(this_week) > 0 else period_low
+            this_week_high = this_week['high'].max() if len(this_week) > 0 else period_high
+            last_week_low = last_week['low'].min() if len(last_week) > 0 else period_low
+            last_week_high = last_week['high'].max() if len(last_week) > 0 else period_high
+            
+            # Store formatted data
+            mt5_symbol = symbol + "m" if not symbol.endswith("m") else symbol
+            formatted_data = (
+                f"[{mt5_symbol}] From JSON file:\n"
+                f"\n>>> ANSWER KEY <<<\n"
+                f"Entire Period Lowest: {period_low}\n"
+                f"Entire Period Highest: {period_high}\n"
+                f"Latest Close: {latest_close}\n"
+                f"This Week (Mon-Fri) Lowest: {this_week_low}\n"
+                f"This Week (Mon-Fri) Highest: {this_week_high}\n"
+                f"Last Week (Mon-Fri) Lowest: {last_week_low}\n"
+                f"Last Week (Mon-Fri) Highest: {last_week_high}"
+            )
+            
+            _json_prices[mt5_symbol] = formatted_data
+        
+        print(f"   ✅ Loaded {len(_json_prices)} symbols from JSON")
+        return True
+    
+    except Exception as e:
+        print(f"   ❌ Failed to load JSON: {e}")
+        return False
+
 
 def ensure_mt5(force_retry: bool = False) -> bool:
     """Returns True if MT5 is ready. If force_retry, resets cached state."""
     global _mt5_initialized
+    
+    # If MT5 is not available (Linux/Mac), return False
+    if not MT5_AVAILABLE:
+        return False
+    
     if force_retry:
         _mt5_initialized = False
     if not _mt5_initialized:
@@ -163,25 +262,37 @@ def get_market_data(ticker_symbol: str) -> str | None:
         clean = ticker_symbol.strip().upper().replace("/", "").replace("=", "").replace("-", "").replace(" ", "")
         mt5_symbol = SYMBOL_MAP.get(clean, clean if clean.endswith("M") else clean + "m")
 
-        # Cache check
+        # Check memory cache first
         cached = _symbol_cache.get(mt5_symbol)
         if cached and (time.time() - cached[0]) < _CACHE_TTL:
             return cached[1]
 
-        if not ensure_mt5():
-            # One retry in case connection went stale
-            if not ensure_mt5(force_retry=True):
-                print(f"❌ MT5 unavailable: {mt5.last_error()}")
-                return None
-
-        data = _fetch_mt5_symbol(mt5_symbol)
-        if data:
+        # Try MT5 first (if available)
+        if MT5_AVAILABLE:
+            if not ensure_mt5():
+                # One retry in case connection went stale
+                if not ensure_mt5(force_retry=True):
+                    print(f"⚠️ MT5 unavailable, checking JSON fallback...")
+                    # Fall through to JSON check below
+            else:
+                data = _fetch_mt5_symbol(mt5_symbol)
+                if data:
+                    _symbol_cache[mt5_symbol] = (time.time(), data)
+                    return data
+                else:
+                    print(f"⚠️ Symbol '{mt5_symbol}' not in Market Watch.")
+        
+        # Try JSON fallback (for Codespaces/Linux)
+        if mt5_symbol in _json_prices:
+            print(f"📦 Using JSON data for {mt5_symbol}")
+            data = _json_prices[mt5_symbol]
             _symbol_cache[mt5_symbol] = (time.time(), data)
             return data
-        else:
-            print(f"⚠️ Symbol '{mt5_symbol}' not in Market Watch.")
+        
+        print(f"❌ No data available for {mt5_symbol} (not in MT5 or JSON)")
+        
     except Exception as e:
-        print(f"❌ MT5 error for {ticker_symbol}: {e}")
+        print(f"❌ Error fetching {ticker_symbol}: {e}")
     return None
 
 
@@ -293,19 +404,20 @@ def solve_question_with_ocr(photo_bytes: BytesIO) -> str:
         
         # Determine question type from text
         question_type = None
-        text_lower = text.lower()
+        # Remove newlines and extra spaces for better matching
+        text_normalized = " ".join(text.lower().split())
         
-        if ("this week" in text_lower or "current week" in text_lower):
-            if ("highest" in text_lower or "high" in text_lower or "maximum" in text_lower):
+        if ("this week" in text_normalized or "current week" in text_normalized or "thisweek" in text_normalized):
+            if ("highest" in text_normalized or "high" in text_normalized or "maximum" in text_normalized):
                 question_type = "THIS_WEEK_HIGH"
-            elif ("lowest" in text_lower or "low" in text_lower or "minimum" in text_lower):
+            elif ("lowest" in text_normalized or "low" in text_normalized or "minimum" in text_normalized):
                 question_type = "THIS_WEEK_LOW"
-        elif ("last week" in text_lower or "previous week" in text_lower):
-            if ("highest" in text_lower or "high" in text_lower or "maximum" in text_lower):
+        elif ("last week" in text_normalized or "previous week" in text_normalized or "lastweek" in text_normalized):
+            if ("highest" in text_normalized or "high" in text_normalized or "maximum" in text_normalized):
                 question_type = "LAST_WEEK_HIGH"
-            elif ("lowest" in text_lower or "low" in text_lower or "minimum" in text_lower):
+            elif ("lowest" in text_normalized or "low" in text_normalized or "minimum" in text_normalized):
                 question_type = "LAST_WEEK_LOW"
-        elif ("close" in text_lower or "closing" in text_lower):
+        elif ("close" in text_normalized or "closing" in text_normalized):
             question_type = "LATEST_CLOSE"
         
         if not question_type:
@@ -595,16 +707,33 @@ async def handle_incoming_post(client: Client, message: Message):
 
 
 if __name__ == "__main__":
-    print("🤖 Initializing MT5 connection...")
-    if mt5.initialize():
-        _mt5_initialized = True
-        print("✅ MT5 Connected!")
-        print("📊 Pre-warming cache...")
-        _pre_warm_cache()
+    # Try to load JSON prices first (for Codespaces)
+    json_loaded = load_json_prices()
+    
+    # Then try MT5 (Windows only)
+    if MT5_AVAILABLE:
+        print("🤖 Initializing MT5 connection...")
+        if mt5.initialize():
+            _mt5_initialized = True
+            print("✅ MT5 Connected!")
+            print("📊 Pre-warming cache...")
+            _pre_warm_cache()
+        else:
+            print(f"⚠️ MT5 Warning: {mt5.last_error()}")
+            if not json_loaded:
+                print("❌ CRITICAL: No MT5 and no JSON data available!")
+                print("   Run generate_prices.py on Windows to create mt5_prices.json")
+                sys.exit(1)
     else:
-        print(f"⚠️ MT5 Warning: {mt5.last_error()}")
+        print("⚠️ MT5 not available on this platform (Linux/Mac)")
+        if not json_loaded:
+            print("❌ CRITICAL: No JSON price data found!")
+            print("   Run generate_prices.py on Windows, then commit mt5_prices.json to GitHub")
+            sys.exit(1)
+        print("✅ Using JSON price data for quiz answers")
 
     print(f"🤖 Listening for images on {TARGET_CHAT}...")
     app.run()
 
-    mt5.shutdown()
+    if MT5_AVAILABLE and _mt5_initialized:
+        mt5.shutdown()
