@@ -385,7 +385,27 @@ async def handle_incoming_post(client: Client, message: Message):
     t_start = time.time()
     
     chat_name = "CHANNEL" if message.chat.id == TARGET_CHANNEL else "CHAT_GROUP"
-    print(f"\n⚡ [IMAGE from {chat_name} #{message.id}] Processing...")
+    
+    # SAFETY: Only process images from official channel (not random users in chat)
+    # If from chat group, only process if forwarded from official channel
+    if message.chat.id == TARGET_CHAT:
+        # Check if it's forwarded from the official channel or posted by channel
+        is_from_official = False
+        
+        if message.forward_from_chat and message.forward_from_chat.id == TARGET_CHANNEL:
+            is_from_official = True
+            print(f"\n⚡ [IMAGE forwarded from CHANNEL to CHAT #{message.id}] Processing...")
+        elif message.sender_chat and message.sender_chat.id == TARGET_CHANNEL:
+            is_from_official = True
+            print(f"\n⚡ [IMAGE from linked CHANNEL in CHAT #{message.id}] Processing...")
+        else:
+            # Random user image in chat - SKIP IT!
+            sender = message.from_user.username if message.from_user else "Unknown"
+            print(f"⏭️  SKIPPED: Image from random user @{sender} in chat (not official quiz)")
+            return
+    else:
+        # Image directly from channel - always process
+        print(f"\n⚡ [IMAGE from CHANNEL #{message.id}] Processing...")
 
     answer = None
     try:
