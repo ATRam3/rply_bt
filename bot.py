@@ -272,11 +272,15 @@ def solve_question_with_ocr(photo_bytes: BytesIO) -> str:
         
         # Parse ticker from text
         ticker = None
+        
+        # Normalize text for better matching (remove slashes, spaces, special chars)
+        normalized_text = text.replace("/", "").replace("-", "").replace(" ", "")
+        
         for known_ticker in ["XAUUSD", "GOLD", "GBPJPY", "GBPUSD", "EURUSD", "USDJPY", 
                             "BTCUSD", "BITCOIN", "EURJPY", "AUDUSD", "USDCAD", "NZDUSD",
                             "USDCHF", "GBPCHF", "NASDAQ", "US500", "US30", "XAGUSD", 
                             "SILVER", "USOIL", "OIL", "CRUDE"]:
-            if known_ticker in text:
+            if known_ticker in normalized_text:
                 ticker = known_ticker
                 break
         
@@ -423,7 +427,7 @@ def solve_question_with_gemini(photo_bytes: BytesIO) -> str:
         
         t_gemini_start = time.time()
         response = client_ai.models.generate_content(
-            model='gemini-1.5-flash-8b',  # OPTIMIZED: Faster model (was gemini-3.5-flash-lite)
+            model='gemini-1.5-flash',  # FIXED: Use gemini-1.5-flash (not 8b)
             contents=[prompt, small_img]
         )
         gemini_time = time.time() - t_gemini_start
