@@ -81,32 +81,52 @@ _CACHE_TTL = 120  # 2 minutes — daily candles barely change
 
 # ── Expanded Exness symbol map (includes common aliases for indices) ──
 SYMBOL_MAP = {
+    # === COMMODITIES ===
     "GOLD": "XAUUSDm", "XAUUSD": "XAUUSDm",
     "SILVER": "XAGUSDm", "XAGUSD": "XAGUSDm",
+    "USOIL": "USOILm", "OIL": "USOILm", "CRUDE": "USOILm", "WTI": "USOILm",
+    "UKOIL": "UKOILm", "BRENT": "UKOILm",
+    
+    # === CRYPTO ===
     "BTCUSD": "BTCUSDm", "BTC": "BTCUSDm", "BITCOIN": "BTCUSDm",
     "ETHUSD": "ETHUSDm", "ETH": "ETHUSDm", "ETHEREUM": "ETHUSDm",
-    "EURUSD": "EURUSDm", "GBPUSD": "GBPUSDm",
-    "USDJPY": "USDJPYm", "GBPJPY": "GBPJPYm",
-    "EURJPY": "EURJPYm", "AUDUSD": "AUDUSDm",
-    "USDCAD": "USDCADm", "USDCHF": "USDCHFm",
-    "NZDUSD": "NZDUSDm", "EURGBP": "EURGBPm",
-    "EURAUD": "EURAUDm", "GBPAUD": "GBPAUDm",
-    "AUDCAD": "AUDCADm", "AUDJPY": "AUDJPYm",
-    "CADJPY": "CADJPYm", "CHFJPY": "CHFJPYm",
-    "NZDJPY": "NZDJPYm", "GBPCAD": "GBPCADm",
-    "GBPCHF": "GBPCHFm", "EURNZD": "EURNZDm",
-    "EURCHF": "EURCHFm", "EURCAD": "EURCADm",
-    "AUDNZD": "AUDNZDm", "AUDCHF": "AUDCHFm",
-    "CADCHF": "CADCHFm", "NZDCAD": "NZDCADm",
-    "NZDCHF": "NZDCHFm", "GBPNZD": "GBPNZDm",
-    # Indices — many aliases because Gemini says "S&P 500" or "Dow Jones"
-    "US30": "US30m", "DJ30": "US30m", "DOW": "US30m", "DOWJONES": "US30m",
-    "US500": "US500m", "SP500": "US500m", "SPX": "US500m", "SPX500": "US500m",
-    "USTEC": "USTECm", "NAS100": "USTECm", "NASDAQ": "USTECm", "NASDAQ100": "USTECm", "NSDQ": "USTECm", "USTECH100": "USTECm",
-    "DE30": "DE30m", "DAX": "DE30m", "DE40": "DE40m",
-    "UK100": "UK100m", "FTSE": "UK100m",
-    "JP225": "JP225m", "NIKKEI": "JP225m",
-    "FR40": "FR40m", "HK50": "HK50m",
+    "LTCUSD": "LTCUSDm", "LTC": "LTCUSDm", "LITECOIN": "LTCUSDm",
+    "XRPUSD": "XRPUSDm", "XRP": "XRPUSDm", "RIPPLE": "XRPUSDm",
+    
+    # === MAJOR FOREX PAIRS ===
+    "EURUSD": "EURUSDm", "GBPUSD": "GBPUSDm", "USDJPY": "USDJPYm",
+    "USDCHF": "USDCHFm", "AUDUSD": "AUDUSDm", "USDCAD": "USDCADm",
+    "NZDUSD": "NZDUSDm",
+    
+    # === CROSS FOREX PAIRS ===
+    "EURJPY": "EURJPYm", "GBPJPY": "GBPJPYm", "EURGBP": "EURGBPm",
+    "AUDJPY": "AUDJPYm", "GBPCHF": "GBPCHFm", "EURCHF": "EURCHFm",
+    "EURAUD": "EURAUDm", "GBPAUD": "GBPAUDm", "AUDCAD": "AUDCADm",
+    "CADJPY": "CADJPYm", "CHFJPY": "CHFJPYm", "NZDJPY": "NZDJPYm",
+    "GBPCAD": "GBPCADm", "EURNZD": "EURNZDm", "EURCAD": "EURCADm",
+    "AUDNZD": "AUDNZDm", "AUDCHF": "AUDCHFm", "CADCHF": "CADCHFm",
+    "NZDCAD": "NZDCADm", "NZDCHF": "NZDCHFm", "GBPNZD": "GBPNZDm",
+    
+    # === US INDICES ===
+    "US30": "US30m", "DJ30": "US30m", "DOW": "US30m", "DOWJONES": "US30m", "DOWINDUSTRIAL": "US30m",
+    "US500": "US500m", "SP500": "US500m", "SPX": "US500m", "SPX500": "US500m", "S&P500": "US500m", "SANDP": "US500m",
+    "USTEC": "USTECm", "NAS100": "USTECm", "NASDAQ": "USTECm", "NASDAQ100": "USTECm", "NSDQ": "USTECm", "USTECH100": "USTECm", "TECH100": "USTECm",
+    "US2000": "US2000m", "RUSSELL2000": "US2000m", "RUSSELL": "US2000m",
+    
+    # === EUROPEAN INDICES ===
+    "DE30": "DE30m", "DAX": "DE30m", "DAX30": "DE30m", "GERMANY30": "DE30m", "GERMAN30": "DE30m",
+    "DE40": "DE40m", "DAX40": "DAX40m", "GERMANY40": "DE40m", "GERMAN40": "DE40m",
+    "UK100": "UK100m", "FTSE": "UK100m", "FTSE100": "UK100m", "UK": "UK100m",
+    "FR40": "FR40m", "CAC": "FR40m", "CAC40": "FR40m", "FRANCE40": "FR40m", "FRENCH40": "FR40m",
+    "ES35": "ES35m", "IBEX": "ES35m", "IBEX35": "ES35m", "SPAIN35": "ES35m", "SPANISH35": "ES35m",
+    "IT40": "IT40m", "FTSEMIB": "IT40m", "ITALY40": "IT40m", "ITALIAN40": "IT40m",
+    "EU50": "EU50m", "EUROSTOXX": "EU50m", "EUROSTOXX50": "EU50m", "STOXX50": "EU50m",
+    
+    # === ASIAN INDICES ===
+    "JP225": "JP225m", "NIKKEI": "JP225m", "NIKKEI225": "JP225m", "JAPAN225": "JP225m", "JPN225": "JP225m",
+    "HK50": "HK50m", "HANGSENG": "HK50m", "HANGSENG50": "HK50m", "HONGKONG50": "HK50m", "HSI": "HK50m",
+    "CN50": "CN50m", "CHINA50": "CN50m", "CHINAA50": "CN50m",
+    "AU200": "AU200m", "ASX200": "AU200m", "AUSTRALIA200": "AU200m", "AUSSIE200": "AU200m",
 }
 
 # Reverse lookup: "XAUUSDm" -> "XAUUSD" (for display)
@@ -386,12 +406,10 @@ def solve_question_with_ocr(photo_bytes: BytesIO) -> str:
         ticker = None
         
         # Normalize text for better matching (remove slashes, spaces, special chars)
-        normalized_text = text.replace("/", "").replace("-", "").replace(" ", "")
+        normalized_text = text.replace("/", "").replace("-", "").replace(" ", "").replace("&", "")
         
-        for known_ticker in ["XAUUSD", "GOLD", "GBPJPY", "GBPUSD", "EURUSD", "USDJPY", 
-                            "BTCUSD", "BITCOIN", "EURJPY", "AUDUSD", "USDCAD", "NZDUSD",
-                            "USDCHF", "GBPCHF", "NASDAQ", "US500", "US30", "XAGUSD", 
-                            "SILVER", "USOIL", "OIL", "CRUDE"]:
+        # Try all known tickers (use SYMBOL_MAP keys for comprehensive matching)
+        for known_ticker in sorted(SYMBOL_MAP.keys(), key=len, reverse=True):
             if known_ticker in normalized_text:
                 ticker = known_ticker
                 break
