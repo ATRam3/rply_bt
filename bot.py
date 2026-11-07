@@ -243,10 +243,11 @@ def _extract_ticker_from_text(text: str) -> str | None:
 
 
 def solve_question_image(photo_bytes: BytesIO) -> str:
-    """Choose OCR or Gemini based on availability"""
+    """Choose OCR or Gemini based on availability and settings"""
     if OCR_AVAILABLE:
         return solve_question_with_ocr(photo_bytes)
     else:
+        # OCR not available - must use Gemini
         return solve_question_with_gemini(photo_bytes)
 
 
@@ -285,8 +286,8 @@ def solve_question_with_ocr(photo_bytes: BytesIO) -> str:
                 break
         
         if not ticker:
-            print("⚠️ No ticker found in text - falling back to Gemini")
-            return solve_question_with_gemini(photo_bytes)
+            print("⚠️ No ticker found in OCR text - skipping (no Gemini fallback)")
+            return None  # Skip instead of falling back to Gemini
         
         print(f"🎯 Ticker found: {ticker}")
         
@@ -308,8 +309,8 @@ def solve_question_with_ocr(photo_bytes: BytesIO) -> str:
             question_type = "LATEST_CLOSE"
         
         if not question_type:
-            print("⚠️ Question type unclear - falling back to Gemini")
-            return solve_question_with_gemini(photo_bytes)
+            print("⚠️ Question type unclear - skipping (no Gemini fallback)")
+            return None  # Skip instead of falling back to Gemini
         
         print(f"❓ Question type: {question_type}")
         
@@ -342,12 +343,12 @@ def solve_question_with_ocr(photo_bytes: BytesIO) -> str:
             print(f"⚡ OCR TOTAL TIME: {total_time:.2f}s | Answer: {answer}")
             return answer
         else:
-            print("⚠️ Answer not found - falling back to Gemini")
-            return solve_question_with_gemini(photo_bytes)
+            print("⚠️ Answer not found - skipping (no Gemini fallback)")
+            return None  # Skip instead of falling back to Gemini
             
     except Exception as e:
-        print(f"❌ OCR error: {e} - falling back to Gemini")
-        return solve_question_with_gemini(photo_bytes)
+        print(f"❌ OCR error: {e} - skipping (no Gemini fallback)")
+        return None  # Skip instead of falling back to Gemini
 
 
 def solve_question_with_gemini(photo_bytes: BytesIO) -> str:
