@@ -358,12 +358,29 @@ def solve_question_image(photo_bytes: BytesIO) -> str:
 
 
 # ==========================================
-# LISTEN STRICTLY FOR IMAGES ONLY IN TARGET CHAT
+# LISTEN TO BOTH CHANNEL AND CHAT GROUP
 # ==========================================
-@app.on_message(filters.chat(TARGET_CHAT) & filters.photo)
+
+# DEBUG LISTENER: Shows ALL messages from BOTH locations  
+@app.on_message(filters.chat([TARGET_CHANNEL, TARGET_CHAT]))
+async def debug_all_messages(client: Client, message: Message):
+    msg_type = "📸 PHOTO" if message.photo else "💬 TEXT" if message.text else "📎 OTHER"
+    sender = "?"
+    if message.sender_chat:
+        sender = f"channel:{message.sender_chat.username or message.sender_chat.title}"
+    elif message.from_user:
+        sender = f"user:{message.from_user.username or message.from_user.first_name}"
+    
+    chat_name = "CHANNEL" if message.chat.id == TARGET_CHANNEL else "CHAT_GROUP"
+    print(f"[{time.strftime('%H:%M:%S')}] {chat_name} | {msg_type} msg#{message.id} from={sender}")
+
+# PHOTO HANDLER: Processes images from BOTH channel and chat group
+@app.on_message(filters.chat([TARGET_CHANNEL, TARGET_CHAT]) & filters.photo)
 async def handle_incoming_post(client: Client, message: Message):
     t_start = time.time()
-    print(f"\n⚡ [IMAGE POST #{message.id}] Processing...")
+    
+    chat_name = "CHANNEL" if message.chat.id == TARGET_CHANNEL else "CHAT_GROUP"
+    print(f"\n⚡ [IMAGE from {chat_name} #{message.id}] Processing...")
 
     answer = None
     try:
@@ -379,6 +396,22 @@ async def handle_incoming_post(client: Client, message: Message):
         print("⚠️ No answer — skipped.")
         return
 
+    # IMPORTANT: Always reply to the CHAT GROUP
+    # If image is from channel, post as new message in chat group
+    if message.chat.id == TARGET_CHANNEL:
+        print(f"📢 Image from CHANNEL - posting answer to CHAT GROUP")
+        try:
+            await client.send_message(
+                chat_id=TARGET_CHAT,
+                text=f"{answer}"
+            )
+            print(f"🚀 [POSTED to CHAT GROUP in {time.time()-t_start:.1f}s total]")
+            return
+        except Exception as e:
+            print(f"❌ Failed to post to chat: {e}")
+            return
+    
+    # If image is from chat group, reply normally
     # Post reply with retry
     for attempt in range(3):
         try:
