@@ -1,15 +1,24 @@
 """
-Quiz answer userbot (final)
----------------------------
-* Prints EVERY post made in the quiz channel (text, photo, video...).
-* Replies ONLY to image posts of the channel; the answer goes to the discussion group.
-* Reads the question (OCR, Gemini backup), looks up REAL candles (MT5 live, or mt5_prices.json),
+Quiz answer userbot (final, reply-to-post edition)
+--------------------------------------------------
+* Watches the quiz channel and logs EVERY post (text, photo, video...).
+* Answers ONLY image posts, as a REPLY to that post's copy in the linked discussion group.
+* Reads the question (OCR, Gemini backup), looks up REAL candles (MT5 live or mt5_prices.json)
   and posts the number.
-* NEVER guesses: if the candle data does not cover the week asked, it refuses and tells you why.
+* NEVER guesses: if the candle data does not cover the week asked, it refuses and says why.
 * Detects other copies of itself (same account) and warns loudly.
 
 Test without Telegram:   python bot_final.py --test path/to/quiz.png
+
+.env keys
+    TELEGRAM_API_ID, TELEGRAM_API_HASH, TARGET_CHANNEL, TARGET_CHAT   (required)
+    GEMINI_API_KEY, GEMINI_MODEL, USE_GEMINI_FALLBACK=1               (optional)
+    HYPE_ENABLED=0, SHOW_GROUP_MESSAGES=0                             (optional)
+    REPLY_FALLBACK_TO_PLAIN=1   post a plain message if the post's copy can't be found
+                                (set 0 to post nothing in that case)
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -29,7 +38,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("bot")
+log = logging.getLogger("bot")
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 if sys.stdout.encoding != "utf-8":
@@ -37,11 +46,11 @@ if sys.stdout.encoding != "utf-8":
 
 load_dotenv()
 
-from pyrogram import Client, filters, idle
-from pyrogram.types import Message
-from pyrogram.errors import FloodWait, ChannelPrivate, PeerIdInvalid
-from PIL import Image, ImageFilter, ImageOps, ImageStat
 import pandas as pd
+from PIL import Image, ImageFilter, ImageOps, ImageStat
+from pyrogram import Client, filters, idle
+from pyrogram.errors import ChannelPrivate, FloodWait, PeerIdInvalid
+from pyrogram.types import Message
 
 try:
     import google.genai as genai
@@ -51,17 +60,19 @@ except ImportError:
 # ── MT5 (Windows only) ───────────────────────────────────────────────────
 try:
     import MetaTrader5 as mt5
+
     MT5_AVAILABLE = True
-    print("✅ MT5: Available (Windows)")
+    log.info("✅ MT5: available (Windows)")
 except ImportError:
-    MT5_AVAILABLE = False
     mt5 = None
-    print("⚠️ MT5: Not available (using mt5_prices.json)")
+    MT5_AVAILABLE = False
+    log.info("⚠️ MT5: not available (using mt5_prices.json)")
 
 # ── OCR ──────────────────────────────────────────────────────────────────
 OCR_AVAILABLE = False
 try:
     import pytesseract
+
     if os.name == "nt":
         for _p in (
             r"C:\Program Files\Tesseract-OCR\tesseract.exe",
@@ -73,12 +84,14 @@ try:
                 break
     pytesseract.get_tesseract_version()
     OCR_AVAILABLE = True
-    print("✅ OCR Mode: Enabled")
+    log.info("✅ OCR: enabled")
 except Exception as _e:
-    print(f"⚠️ OCR Mode: Disabled ({_e})")
+    log.warning(f"⚠️ OCR: disabled ({_e})")
 
 
-# ── Config ───────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═════════════════════════════════════════════════════════════════════════
 def _env_int(name: str) -> int:
     v = os.getenv(name)
     if not v:
@@ -86,23 +99,31 @@ def _env_int(name: str) -> int:
     return int(v.strip())
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip() == "1"
+
+
 API_ID = _env_int("TELEGRAM_API_ID")
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-TARGET_CHANNEL = _env_int("TARGET_CHANNEL")   # quiz channel (we READ it)
-TARGET_CHAT = _env_int("TARGET_CHAT")         # discussion group (we ANSWER there)
+TARGET_CHANNEL = _env_int("TARGET_CHANNEL")  # quiz channel (we READ it)
+TARGET_CHAT = _env_int("TARGET_CHAT")        # linked discussion group (we ANSWER there)
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-USE_GEMINI_FALLBACK = os.getenv("USE_GEMINI_FALLBACK", "1") == "1"
-HYPE_ENABLED = os.getenv("HYPE_ENABLED", "0") == "1"
-SHOW_GROUP_MESSAGES = os.getenv("SHOW_GROUP_MESSAGES", "0") == "1"
+USE_GEMINI_FALLBACK = _env_flag("USE_GEMINI_FALLBACK", "1")
+HYPE_ENABLED = _env_flag("HYPE_ENABLED")
+SHOW_GROUP_MESSAGES = _env_flag("SHOW_GROUP_MESSAGES")
+REPLY_FALLBACK_TO_PLAIN = _env_flag("REPLY_FALLBACK_TO_PLAIN", "1")
+
 client_ai = genai.Client(api_key=GEMINI_API_KEY) if (genai and GEMINI_API_KEY) else None
 
-MAX_POST_AGE = 180
+MAX_POST_AGE = 180        # ignore image posts older than this (seconds)
 POLL_INTERVAL = 1.5
 MT5_CACHE_TTL = 5
-STALE_DAYS = 4
 SESSION_WINDOW = 1800     # a session active in the last 30 min counts as "running"
+DISCUSSION_ATTEMPTS = 20  # how many times to look for the post's copy in the group
+DISCUSSION_DELAY = 0.5
+LOCK_PORT = 47831
 
 app = Client("fast_image_userbot", api_id=API_ID, api_hash=API_HASH, sleep_threshold=20)
 
@@ -110,7 +131,7 @@ app = Client("fast_image_userbot", api_id=API_ID, api_hash=API_HASH, sleep_thres
 _mt5_initialized = False
 _symbol_cache: dict[str, tuple[float, dict]] = {}
 _json_frames: dict[str, tuple[pd.DataFrame, int]] = {}
-_json_meta = {"generated_at": None, "mtime": None}
+_json_meta: dict = {"generated_at": None, "mtime": None}
 
 _SEEN_MAX = 1000
 _seen: "OrderedDict[tuple, float]" = OrderedDict()
@@ -126,7 +147,9 @@ def _claim(key: tuple) -> bool:
     return True
 
 
-# ── Symbol map ───────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════
+# SYMBOL MAP
+# ═════════════════════════════════════════════════════════════════════════
 SYMBOL_MAP = {
     "GOLD": "XAUUSDm", "XAUUSD": "XAUUSDm",
     "SILVER": "XAGUSDm", "XAGUSD": "XAGUSDm",
@@ -165,11 +188,16 @@ SYMBOL_MAP = {
 }
 CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD", "XAU", "XAG"}
 
+PREWARM_SYMBOLS = [
+    "XAUUSDm", "GBPJPYm", "EURUSDm", "BTCUSDm", "GBPUSDm", "USDJPYm", "EURJPYm", "AUDUSDm",
+    "USDCADm", "USDCHFm", "US30m", "US500m", "USTECm", "GBPCHFm", "NZDUSDm", "DE40m",
+    "UK100m", "FR40m", "XAGUSDm",
+]
+
 
 # ═════════════════════════════════════════════════════════════════════════
 # MARKET DATA  (strict: never guesses)
 # ═════════════════════════════════════════════════════════════════════════
-
 def _infer_digits(series) -> int:
     best = 0
     for v in series:
@@ -193,7 +221,8 @@ def _build_keys(df: pd.DataFrame, digits: int, now: pd.Timestamp | None = None) 
     last_monday = this_monday - pd.Timedelta(days=7)
 
     def week_of(monday):
-        return weekdays[(weekdays["time"] >= monday) & (weekdays["time"] < monday + pd.Timedelta(days=5))]
+        end = monday + pd.Timedelta(days=5)
+        return weekdays[(weekdays["time"] >= monday) & (weekdays["time"] < end)]
 
     this_week, last_week = week_of(this_monday), week_of(last_monday)
 
@@ -227,18 +256,22 @@ def _answer_from_data(data: dict, question_type: str) -> tuple[str | None, str]:
     now = data["now"]
     weekend = now.dayofweek >= 5
     tm, lm = data["this_monday"], data["last_monday"]
-    info = (f"{question_type} | source={data['source']} | last candle {data['last_candle'].date()} | "
-            f"this week {tm.date()}..{(tm + pd.Timedelta(days=4)).date()} ({data['this_count']} candles) | "
-            f"last week {lm.date()}..{(lm + pd.Timedelta(days=4)).date()} ({data['last_count']} candles)")
+    info = (
+        f"{question_type} | source={data['source']} | last candle {data['last_candle'].date()} | "
+        f"this week {tm.date()}..{(tm + pd.Timedelta(days=4)).date()} ({data['this_count']} candles) | "
+        f"last week {lm.date()}..{(lm + pd.Timedelta(days=4)).date()} ({data['last_count']} candles)"
+    )
 
     if question_type.startswith("THIS_WEEK"):
         if data["this_count"] == 0:
             return None, f"🛑 REFUSING: no candles for the current week — data is STALE. {info}"
         if weekend and data["this_count"] < 4:
-            return None, f"🛑 REFUSING: only {data['this_count']} candles this week on a weekend — data incomplete. {info}"
+            return None, (f"🛑 REFUSING: only {data['this_count']} candles this week on a weekend — "
+                          f"data incomplete. {info}")
     elif question_type.startswith("LAST_WEEK"):
         if data["last_count"] < 3:
-            return None, f"🛑 REFUSING: only {data['last_count']} candles for last week — data incomplete/stale. {info}"
+            return None, (f"🛑 REFUSING: only {data['last_count']} candles for last week — "
+                          f"data incomplete/stale. {info}")
 
     value = data.get(question_type.lower())
     if value is None:
@@ -254,13 +287,17 @@ def load_json_prices() -> bool:
     try:
         with open(json_file, "r") as f:
             data = json.load(f)
-        frames = {}
+
+        frames: dict[str, tuple[pd.DataFrame, int]] = {}
         for entry in data.get("prices", []):
             if entry.get("timeframe") != "D1" or not entry.get("bars"):
                 continue
             df = pd.DataFrame(
-                [{"time": pd.to_datetime(b["time"]), "open": b["open"], "high": b["high"],
-                  "low": b["low"], "close": b["close"]} for b in entry["bars"]]
+                [
+                    {"time": pd.to_datetime(b["time"]), "open": b["open"], "high": b["high"],
+                     "low": b["low"], "close": b["close"]}
+                    for b in entry["bars"]
+                ]
             )
             sym = entry["symbol"]
             mt5_symbol = sym if sym.endswith("m") else sym + "m"
@@ -274,19 +311,19 @@ def load_json_prices() -> bool:
         _json_meta["generated_at"] = data.get("generated_at", "unknown")
         _json_meta["mtime"] = os.path.getmtime(json_file)
         _symbol_cache.clear()
-        print(f"📦 Loaded {json_file}: {len(frames)} symbols (generated {_json_meta['generated_at']})")
+        log.info(f"📦 Loaded {json_file}: {len(frames)} symbols (generated {_json_meta['generated_at']})")
         return bool(frames)
     except Exception as e:
-        print(f"❌ Failed to load JSON: {e}")
+        log.error(f"❌ Failed to load JSON: {e}")
         return False
 
 
-def _maybe_reload_json():
+def _maybe_reload_json() -> None:
     """After a `git pull` the new file is picked up automatically — no restart needed."""
     try:
         m = os.path.getmtime("mt5_prices.json")
         if _json_meta["mtime"] is not None and m != _json_meta["mtime"]:
-            print("🔁 mt5_prices.json changed — reloading")
+            log.info("🔁 mt5_prices.json changed — reloading")
             load_json_prices()
     except OSError:
         pass
@@ -338,9 +375,9 @@ def get_market_data(ticker: str) -> dict | None:
                 if data:
                     _symbol_cache[mt5_symbol] = (time.time(), data)
                 else:
-                    print(f"⚠️ '{mt5_symbol}' not in Market Watch — trying JSON")
+                    log.warning(f"⚠️ '{mt5_symbol}' not in Market Watch — trying JSON")
             else:
-                print("⚠️ MT5 unavailable — trying JSON")
+                log.warning("⚠️ MT5 unavailable — trying JSON")
 
         if data is None and mt5_symbol in _json_frames:
             df, digits = _json_frames[mt5_symbol]
@@ -348,23 +385,21 @@ def get_market_data(ticker: str) -> dict | None:
             data["source"] = f"JSON generated {_json_meta['generated_at']}"
 
         if data is None:
-            print(f"❌ No data for {mt5_symbol} (not in MT5 or JSON)")
+            log.error(f"❌ No data for {mt5_symbol} (not in MT5 or JSON)")
             return None
         data["symbol"] = mt5_symbol
         return data
     except Exception as e:
-        print(f"❌ Error fetching {ticker}: {e}")
+        log.error(f"❌ Error fetching {ticker}: {e}")
         return None
 
 
-def _pre_warm_cache():
+def _pre_warm_cache() -> None:
     if not ensure_mt5():
         return
-    for sym in ["XAUUSDm", "GBPJPYm", "EURUSDm", "BTCUSDm", "GBPUSDm", "USDJPYm",
-                "EURJPYm", "AUDUSDm", "USDCADm", "USDCHFm", "US30m", "US500m",
-                "USTECm", "GBPCHFm", "NZDUSDm", "DE40m", "UK100m", "FR40m", "XAGUSDm"]:
+    for sym in PREWARM_SYMBOLS:
         if mt5.symbol_select(sym, True):
-            print(f"  ✅ Selected {sym}")
+            log.info(f"  ✅ Selected {sym}")
 
 
 def _lookup(ticker: str, qtype: str) -> str | None:
@@ -372,14 +407,13 @@ def _lookup(ticker: str, qtype: str) -> str | None:
     if not data:
         return None
     answer, info = _answer_from_data(data, qtype)
-    print(f"{'🧮' if answer else ''} {data.get('symbol', ticker)} → {answer} | {info}")
+    log.info(f"{'🧮' if answer else '🛑'} {data.get('symbol', ticker)} → {answer} | {info}")
     return answer
 
 
 # ═════════════════════════════════════════════════════════════════════════
 # QUESTION PARSING
 # ═════════════════════════════════════════════════════════════════════════
-
 _INDEX_RE = re.compile(r"(US|DE|UK|FR|ES|IT|EU|JP|HK|CN|AU)\d{2,4}")
 
 
@@ -388,12 +422,13 @@ def _find_ticker(text: str) -> str | None:
     for i, tok in enumerate(tokens):
         if len(tok) >= 3 and tok in SYMBOL_MAP:
             return tok
-        for n in (2, 3):                       # 'XAU USD', 'S&P 500'
+        for n in (2, 3):  # 'XAU USD', 'S&P 500'
             if i + n <= len(tokens):
                 joined = "".join(tokens[i:i + n])
                 if len(joined) >= 4 and joined in SYMBOL_MAP:
                     return joined
-        if re.fullmatch(r"[A-Z]{6}", tok) and tok[:3] in CURRENCIES and tok[3:] in CURRENCIES and tok[:3] != tok[3:]:
+        if (re.fullmatch(r"[A-Z]{6}", tok)
+                and tok[:3] in CURRENCIES and tok[3:] in CURRENCIES and tok[:3] != tok[3:]):
             return tok
         if _INDEX_RE.fullmatch(tok):
             return tok
@@ -403,7 +438,7 @@ def _find_ticker(text: str) -> str | None:
 def _parse_question_type(text: str) -> str | None:
     t = " ".join(text.lower().split())
 
-    def pos(pattern):
+    def pos(pattern: str) -> int | None:
         m = re.search(pattern, t)
         return m.start() if m else None
 
@@ -424,7 +459,6 @@ def _parse_question_type(text: str) -> str | None:
 # ═════════════════════════════════════════════════════════════════════════
 # OCR + GEMINI
 # ═════════════════════════════════════════════════════════════════════════
-
 def _prep_for_ocr(img: Image.Image, binarize: bool) -> Image.Image:
     g = img.convert("L")
     if g.width < 1000:
@@ -434,7 +468,7 @@ def _prep_for_ocr(img: Image.Image, binarize: bool) -> Image.Image:
         f = 1800 / g.width
         g = g.resize((int(g.width * f), int(g.height * f)), Image.LANCZOS)
     g = ImageOps.autocontrast(g)
-    if ImageStat.Stat(g).mean[0] < 110:      # dark card -> invert (Tesseract wants dark-on-light)
+    if ImageStat.Stat(g).mean[0] < 110:  # dark card -> invert (Tesseract wants dark-on-light)
         g = ImageOps.invert(g)
     if binarize:
         g = g.filter(ImageFilter.SHARPEN).point(lambda x: 255 if x > 140 else 0)
@@ -443,13 +477,16 @@ def _prep_for_ocr(img: Image.Image, binarize: bool) -> Image.Image:
 
 def solve_with_ocr(img: Image.Image) -> str | None:
     t0 = time.time()
-    all_text, ticker, qtype = [], None, None
+    all_text: list[str] = []
+    ticker = qtype = None
 
     for binarize, psm in [(False, 6), (True, 6), (False, 11), (True, 3)]:
         try:
-            text = pytesseract.image_to_string(_prep_for_ocr(img, binarize), config=f"--psm {psm}").strip()
+            text = pytesseract.image_to_string(
+                _prep_for_ocr(img, binarize), config=f"--psm {psm}"
+            ).strip()
         except Exception as e:
-            logger.warning(f"OCR pass failed (psm {psm}): {e}")
+            log.warning(f"OCR pass failed (psm {psm}): {e}")
             continue
         if not text:
             continue
@@ -463,8 +500,8 @@ def solve_with_ocr(img: Image.Image) -> str | None:
         ticker = ticker or _find_ticker(merged)
         qtype = qtype or _parse_question_type(merged)
 
-    print("📝 OCR text:\n" + ("\n".join(all_text)[:600] or "(nothing read)"))
-    print(f"⏱️  OCR {time.time()-t0:.2f}s | ticker={ticker} | type={qtype}")
+    log.info("📝 OCR text:\n" + ("\n".join(all_text)[:600] or "(nothing read)"))
+    log.info(f"⏱️  OCR {time.time() - t0:.2f}s | ticker={ticker} | type={qtype}")
     if not ticker or not qtype:
         return None
     return _lookup(ticker, qtype)
@@ -484,13 +521,13 @@ def solve_with_gemini(img: Image.Image) -> str | None:
         )
         resp = client_ai.models.generate_content(model=GEMINI_MODEL, contents=[prompt, small])
         result = (resp.text or "").strip().upper()
-        print(f"🔎 Gemini: {result}")
+        log.info(f"🔎 Gemini: {result}")
         if "|" not in result:
             return None
-        symbol, qtype = [p.strip() for p in result.split("|", 1)]
+        symbol, qtype = (p.strip() for p in result.split("|", 1))
         return _lookup(symbol, qtype)
     except Exception as e:
-        print(f"❌ Gemini error: {e}")
+        log.error(f"❌ Gemini error: {e}")
         return None
 
 
@@ -505,15 +542,82 @@ def solve_question_image(photo_bytes: BytesIO) -> str | None:
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# DISCUSSION GROUP: find the channel post's copy and reply to it
+# ═════════════════════════════════════════════════════════════════════════
+def _is_copy_of_post(m: Message, channel_id: int, post_id: int) -> bool:
+    """True if `m` (in the group) is the auto-forwarded copy of channel post `post_id`."""
+    # Older Pyrogram / Kurigram flat attributes
+    fc = getattr(m, "forward_from_chat", None)
+    if fc and fc.id == channel_id and getattr(m, "forward_from_message_id", None) == post_id:
+        return True
+    # Newer forward_origin style
+    fo = getattr(m, "forward_origin", None)
+    if fo:
+        chat = getattr(fo, "chat", None)
+        if chat and chat.id == channel_id and getattr(fo, "message_id", None) == post_id:
+            return True
+    return False
+
+
+async def _find_discussion_message(client: Client, post_id: int) -> Message | None:
+    """
+    Returns the message in the discussion group that mirrors the channel post (the message you
+    'reply' to). Retries because Telegram needs a moment to create the copy.
+    """
+    for _ in range(DISCUSSION_ATTEMPTS):
+        # Method 1: official API
+        getter = getattr(client, "get_discussion_message", None)
+        if getter:
+            try:
+                dm = await getter(TARGET_CHANNEL, post_id)
+                if dm:
+                    return dm
+            except FloodWait as fw:
+                await asyncio.sleep(fw.value)
+            except Exception as e:
+                log.debug(f"get_discussion_message not ready yet: {e}")
+
+        # Method 2: scan the group's recent history for the forwarded copy
+        try:
+            async for m in client.get_chat_history(TARGET_CHAT, limit=20):
+                if _is_copy_of_post(m, TARGET_CHANNEL, post_id):
+                    return m
+        except Exception as e:
+            log.debug(f"history scan failed: {e}")
+
+        await asyncio.sleep(DISCUSSION_DELAY)
+    return None
+
+
+async def _send_answer(client: Client, disc_msg: Message | None, answer: str) -> str:
+    """Reply to the post's copy in the group. Returns 'reply' or 'plain'."""
+    if disc_msg is not None:
+        await disc_msg.reply_text(answer, quote=True)
+        return "reply"
+    if REPLY_FALLBACK_TO_PLAIN:
+        await client.send_message(TARGET_CHAT, answer)
+        return "plain"
+    raise RuntimeError("discussion copy of the post not found and plain fallback is disabled")
+
+
+async def _send_with_flood_retry(client: Client, disc_msg: Message | None, answer: str) -> str:
+    try:
+        return await _send_answer(client, disc_msg, answer)
+    except FloodWait as fw:
+        log.warning(f"⏳ FloodWait {fw.value}s")
+        await asyncio.sleep(fw.value)
+        return await _send_answer(client, disc_msg, answer)
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # DUPLICATE GUARD ACROSS COPIES (other PC / Codespaces / old script, same account)
 # ═════════════════════════════════════════════════════════════════════════
-
 _NUM_RE = re.compile(r"^-?\d[\d.,]*$")
 
 
 async def _own_numeric_posts(client: Client, since_ts: float) -> list[tuple[int, str]]:
-    """Answers (numbers) that THIS ACCOUNT already posted in the group since `since_ts`."""
-    found = []
+    """Numeric answers THIS ACCOUNT already posted in the group since `since_ts`."""
+    found: list[tuple[int, str]] = []
     try:
         async for m in client.get_chat_history(TARGET_CHAT, limit=20):
             if m.date and m.date.timestamp() < since_ts:
@@ -522,23 +626,24 @@ async def _own_numeric_posts(client: Client, since_ts: float) -> list[tuple[int,
             if getattr(m, "outgoing", False) and _NUM_RE.match(txt):
                 found.append((m.id, txt))
     except Exception as e:
-        logger.warning(f"duplicate-guard history read failed: {e}")
+        log.warning(f"duplicate-guard history read failed: {e}")
     return found
 
 
-async def _audit_after(client: Client, since_ts: float, mine: str):
+async def _audit_after(client: Client, since_ts: float, mine: str) -> None:
     await asyncio.sleep(4)
     posts = await _own_numeric_posts(client, since_ts)
     if len(posts) > 1:
         texts = ", ".join(t for _, t in posts)
-        print(f"🚨 DUPLICATES: this account posted {len(posts)} answers for this quiz: [{texts}] "
-              f"(mine was {mine}). ANOTHER COPY OF THE BOT IS RUNNING — stop it!")
+        log.error(f"🚨 DUPLICATES: this account posted {len(posts)} answers for this quiz: [{texts}] "
+                  f"(mine was {mine}). ANOTHER COPY OF THE BOT IS RUNNING — stop it!")
 
 
-async def _warn_other_sessions(client: Client):
-    """Lists other sessions of this account that use the same API ID and were active recently."""
+async def _warn_other_sessions(client: Client) -> None:
+    """Lists other sessions of this account using the same API ID that were active recently."""
     try:
         from pyrogram.raw.functions.account import GetAuthorizations
+
         res = await client.invoke(GetAuthorizations())
         now = time.time()
         others = []
@@ -550,20 +655,19 @@ async def _warn_other_sessions(client: Client):
             ago = int((now - a.date_active) / 60)
             others.append(f"{a.device_model} / {a.platform} / ip {a.ip} ({a.country}) — active {ago} min ago")
         if others:
-            print("🚨 OTHER COPIES OF THIS BOT MAY BE RUNNING (same API ID, same account):")
+            log.error("🚨 OTHER COPIES OF THIS BOT MAY BE RUNNING (same API ID, same account):")
             for o in others:
-                print(f"     • {o}")
-            print("   Stop them (old terminals, Codespaces, other PC) or you will get double answers.\n")
+                log.error(f"     • {o}")
+            log.error("   Stop them (old terminals, Codespaces, other PC) or you will get double answers.")
         else:
-            print("✅ No other recent session found for this API ID")
+            log.info("✅ No other recent session found for this API ID")
     except Exception as e:
-        logger.warning(f"session check skipped: {e}")
+        log.warning(f"session check skipped: {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════
 # CHANNEL POST HANDLING
 # ═════════════════════════════════════════════════════════════════════════
-
 def _post_kind(m: Message) -> str:
     if m.photo:
         return "📸 PHOTO"
@@ -590,62 +694,81 @@ def _is_image(m: Message) -> bool:
     return bool(m.document and (m.document.mime_type or "").startswith("image/"))
 
 
-async def handle_channel_post(client: Client, message: Message, source: str):
+async def _cancel(task: asyncio.Task | None) -> None:
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+async def handle_channel_post(client: Client, message: Message, source: str) -> None:
     """Called by BOTH the push handler and the poller; the first to see a post wins."""
     if not _claim(("post", message.id)):
-        print(f"   ⚠️ [{source}] SKIP #{message.id} - already processed by another handler")
+        log.info(f"   ⚠️ [{source}] SKIP #{message.id} - already processed by another handler")
         return
 
     preview = (message.text or message.caption or "").replace("\n", " ")[:80]
-    print(f"\n📨 [{source}] CHANNEL POST #{message.id} | {_post_kind(message)} | {preview}")
+    log.info(f"📨 [{source}] CHANNEL POST #{message.id} | {_post_kind(message)} | {preview}")
 
     if not _is_image(message):
-        print("   ↳ not an image — no reply")
+        log.info("   ↳ not an image — no reply")
         return
 
     post_ts = message.date.timestamp() if message.date else time.time() - 5
     if time.time() - post_ts > MAX_POST_AGE:
-        print("   ↳ image is too old — no reply")
+        log.info("   ↳ image is too old — no reply")
         return
 
     t_start = time.time()
-    answer = None
+    answer: str | None = None
+
+    # Start looking for the post's copy in the group NOW, in parallel with solving
+    disc_task = asyncio.create_task(_find_discussion_message(client, message.id))
+
     try:
         photo = await client.download_media(message, in_memory=True)
         answer = await asyncio.to_thread(solve_question_image, photo)
         if answer:
-            print(f"   ✅ Calculated answer: {answer}")
+            log.info(f"   ✅ Calculated answer: {answer}")
     except Exception as e:
-        print(f"❌ Image handling error: {e}")
+        log.error(f"❌ Image handling error: {e}")
 
     if not answer:
-        print("   ↳ no trustworthy answer — nothing posted")
+        await _cancel(disc_task)
+        log.info("   ↳ no trustworthy answer — nothing posted")
         return
 
-    # Cross-copy guard: did this account (another copy) already answer this quiz?
+    # Cross-copy guard: did another copy of this account already answer this quiz?
     await asyncio.sleep(random.uniform(0.15, 0.6))
     existing = await _own_numeric_posts(client, post_ts - 3)
     if existing:
         texts = [t for _, t in existing]
         if answer in texts:
-            print(f"   ↳ another copy already posted the same answer {answer} — skipping")
+            await _cancel(disc_task)
+            log.info(f"   ↳ another copy already posted the same answer {answer} — skipping")
             return
-        print(f"🚨 CONFLICT: another copy of this account posted {texts} but I computed {answer}. "
-              f"Posting mine too — and you must stop the other copy!")
+        log.error(f"🚨 CONFLICT: another copy of this account posted {texts} but I computed {answer}. "
+                  f"Posting mine too — and you must stop the other copy!")
+
+    disc_msg: Message | None = None
+    try:
+        disc_msg = await disc_task
+    except Exception as e:
+        log.warning(f"⚠️ Could not locate the post in the group: {e}")
+
+    if disc_msg is None:
+        log.warning("⚠️ Discussion copy of the post NOT found — "
+                    + ("posting a plain message" if REPLY_FALLBACK_TO_PLAIN else "not posting"))
 
     try:
-        await client.send_message(TARGET_CHAT, answer)
-        print(f"🚀 POSTED {answer} to group in {time.time()-t_start:.1f}s")
+        mode = await _send_with_flood_retry(client, disc_msg, answer)
+        label = "as REPLY to the post" if mode == "reply" else "as plain message"
+        log.info(f"🚀 POSTED {answer} {label} in {time.time() - t_start:.1f}s")
         asyncio.create_task(_audit_after(client, post_ts - 3, answer))
-    except FloodWait as fw:
-        await asyncio.sleep(fw.value)
-        try:
-            await client.send_message(TARGET_CHAT, answer)
-            print(f"🚀 POSTED {answer} (after FloodWait)")
-        except Exception as e2:
-            print(f"❌ Failed after FloodWait: {e2}")
     except Exception as e:
-        print(f"❌ Failed to post to group: {e}")
+        log.error(f"❌ Failed to post to group: {e}")
 
 
 @app.on_message(filters.chat(TARGET_CHANNEL), group=0)
@@ -655,13 +778,15 @@ async def on_channel_message(client: Client, message: Message):
 
 @app.on_message(filters.chat(TARGET_CHAT), group=1)
 async def on_group_message(client: Client, message: Message):
-    if SHOW_GROUP_MESSAGES:
-        who = (message.from_user.first_name if message.from_user
-               else message.sender_chat.title if message.sender_chat else "?")
-        preview = (message.text or message.caption or "").replace("\n", " ")[:60]
-        print(f"   💬 [GROUP] #{message.id} {_post_kind(message)} from {who}: {preview}")
+    if not SHOW_GROUP_MESSAGES:
+        return
+    who = (message.from_user.first_name if message.from_user
+           else message.sender_chat.title if message.sender_chat else "?")
+    preview = (message.text or message.caption or "").replace("\n", " ")[:60]
+    log.info(f"   💬 [GROUP] #{message.id} {_post_kind(message)} from {who}: {preview}")
 
 
+# ── Optional hype message ────────────────────────────────────────────────
 HYPE_MESSAGES = ["Let's gooo! 🔥", "LET'S GO! 💪", "Ready! Let's goooo! 🚀", "ተዘጋጅቻለሁ! 🔥"]
 HYPE_KEYWORDS = ["ተዘጋጁ", "ይቀርባል", "quiz time", "get ready"]
 _last_hype = 0.0
@@ -682,22 +807,21 @@ async def hype_handler(client: Client, message: Message):
     try:
         await client.send_message(TARGET_CHAT, random.choice(HYPE_MESSAGES))
     except Exception as e:
-        print(f"❌ Hype error: {e}")
+        log.error(f"❌ Hype error: {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════
 # POLLING SAFETY NET + KEEP ONLINE
 # ═════════════════════════════════════════════════════════════════════════
-
-async def _poll_channel(client: Client):
-    logger.info("🔄 Polling safety net started")
+async def _poll_channel(client: Client) -> None:
+    log.info("🔄 Polling safety net started")
     last_seen: int | None = None
     delay = POLL_INTERVAL
 
     while True:
         try:
             _maybe_reload_json()
-            new = []
+            new: list[Message] = []
             async for msg in client.get_chat_history(TARGET_CHANNEL, limit=5):
                 if last_seen is not None and msg.id <= last_seen:
                     break
@@ -706,55 +830,56 @@ async def _poll_channel(client: Client):
             if last_seen is None:
                 last_seen = new[0].id if new else 0
                 for m in new:
-                    _claim(("post", m.id))          # seed only; never answer old posts
-                logger.info(f"🔄 Poll seeded at #{last_seen}")
+                    _claim(("post", m.id))  # seed only; never answer old posts
+                log.info(f"🔄 Poll seeded at #{last_seen}")
             else:
                 for msg in reversed(new):
                     last_seen = max(last_seen, msg.id)
-                    await handle_channel_post(client, msg, "POLL")
+                    # run as a task so a slow solve never blocks the poller
+                    asyncio.create_task(handle_channel_post(client, msg, "POLL"))
             delay = POLL_INTERVAL
         except FloodWait as fw:
             await asyncio.sleep(fw.value + 1)
             continue
         except Exception as e:
-            logger.warning(f"🔄 Poll error: {e} — retry in {delay:.0f}s")
+            log.warning(f"🔄 Poll error: {e} — retry in {delay:.0f}s")
             delay = min(delay * 2, 30)
         await asyncio.sleep(delay)
 
 
-async def _keep_online(client: Client):
+async def _keep_online(client: Client) -> None:
     from pyrogram.raw.functions.account import UpdateStatus
+
     while True:
         try:
             await client.invoke(UpdateStatus(offline=False))
         except FloodWait as fw:
             await asyncio.sleep(fw.value)
         except Exception as e:
-            logger.warning(f"🟢 keep_online error: {e}")
+            log.warning(f"🟢 keep_online error: {e}")
         await asyncio.sleep(240)
 
 
 # ═════════════════════════════════════════════════════════════════════════
 # STARTUP / MAIN
 # ═════════════════════════════════════════════════════════════════════════
-
-async def _startup_checks(client: Client):
-    print("\n🔍 STARTUP CHECKS")
+async def _startup_checks(client: Client) -> None:
+    log.info("🔍 STARTUP CHECKS")
     found = {TARGET_CHANNEL: False, TARGET_CHAT: False}
     try:
         async for dialog in client.get_dialogs():
             if dialog.chat.id in found:
                 found[dialog.chat.id] = True
-                print(f"   ✅ Found: {dialog.chat.title} ({dialog.chat.id})")
+                log.info(f"   ✅ Found: {dialog.chat.title} ({dialog.chat.id})")
     except Exception as e:
-        print(f"   ❌ Error loading dialogs: {e}")
+        log.error(f"   ❌ Error loading dialogs: {e}")
 
     for chat_id, ok in found.items():
         if ok:
             continue
         try:
             ch = await client.get_chat(chat_id)
-            print(f"   ✅ Resolved: {ch.title}")
+            log.info(f"   ✅ Resolved: {ch.title}")
         except ChannelPrivate:
             sys.exit(f"❌ {chat_id} is private and this account is not a member — join it in the Telegram app.")
         except PeerIdInvalid:
@@ -762,33 +887,50 @@ async def _startup_checks(client: Client):
         except Exception as e:
             sys.exit(f"❌ Cannot resolve {chat_id}: {e}")
 
+    # Verify the group really is the channel's discussion group (needed for replies)
+    try:
+        ch = await client.get_chat(TARGET_CHANNEL)
+        linked = getattr(ch, "linked_chat", None)
+        if linked and linked.id != TARGET_CHAT:
+            log.error(f"🚨 TARGET_CHAT ({TARGET_CHAT}) is NOT the channel's linked discussion group "
+                      f"({linked.id}). Replies to posts will not work until you fix .env.")
+        elif linked:
+            log.info(f"   ✅ TARGET_CHAT is the linked discussion group of the channel")
+        else:
+            log.warning("   ⚠️ Could not confirm the channel's linked discussion group")
+    except Exception as e:
+        log.warning(f"   ⚠️ Linked-group check skipped: {e}")
+
     me = await client.get_me()
-    print(f"👤 Logged in as: {me.first_name} (@{me.username or 'no-username'})")
+    log.info(f"👤 Logged in as: {me.first_name} (@{me.username or 'no-username'})")
     await _warn_other_sessions(client)
-    print(f"✅ Watching channel {TARGET_CHANNEL} | answering images in group {TARGET_CHAT}")
-    print(f"   Hype: {'ON' if HYPE_ENABLED else 'OFF'} | Gemini fallback: "
-          f"{'ON' if (USE_GEMINI_FALLBACK and client_ai) else 'OFF'} | "
-          f"Data: {'MT5 live' if MT5_AVAILABLE else 'JSON ' + str(_json_meta['generated_at'])}\n")
+    log.info(
+        f"✅ Watching channel {TARGET_CHANNEL} | replying to image posts in group {TARGET_CHAT}\n"
+        f"   Hype: {'ON' if HYPE_ENABLED else 'OFF'} | "
+        f"Gemini fallback: {'ON' if (USE_GEMINI_FALLBACK and client_ai) else 'OFF'} | "
+        f"Plain fallback: {'ON' if REPLY_FALLBACK_TO_PLAIN else 'OFF'} | "
+        f"Data: {'MT5 live' if MT5_AVAILABLE else 'JSON ' + str(_json_meta['generated_at'])}"
+    )
 
 
-def _single_instance_lock():
+def _single_instance_lock() -> socket.socket:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s.bind(("127.0.0.1", 47831))
+        s.bind(("127.0.0.1", LOCK_PORT))
     except OSError:
         sys.exit("❌ Another copy of this bot is already running on this machine. Close it first.")
     return s
 
 
-async def main():
+async def main() -> None:
     json_loaded = load_json_prices()
 
     if MT5_AVAILABLE:
         if ensure_mt5():
-            print("✅ MT5 Connected!")
+            log.info("✅ MT5 connected")
             _pre_warm_cache()
         else:
-            print(f"⚠️ MT5 not ready: {mt5.last_error()}")
+            log.warning(f"⚠️ MT5 not ready: {mt5.last_error()}")
             if not json_loaded:
                 sys.exit("❌ No MT5 and no JSON data available!")
     elif not json_loaded:
@@ -796,13 +938,9 @@ async def main():
 
     await app.start()
     await _startup_checks(app)
-    
-    # Warn about other active sessions
-    print("\n🔍 Checking for other bot sessions...")
-    await _warn_other_sessions(app)
 
     tasks = [asyncio.create_task(_poll_channel(app)), asyncio.create_task(_keep_online(app))]
-    print("🤖 Bot is running. Press Ctrl+C to stop.\n")
+    log.info("🤖 Bot is running. Press Ctrl+C to stop.")
     try:
         await idle()
     finally:
@@ -811,7 +949,7 @@ async def main():
         await app.stop()
         if MT5_AVAILABLE and _mt5_initialized:
             mt5.shutdown()
-        print("👋 Bot stopped.")
+        log.info("👋 Bot stopped.")
 
 
 if __name__ == "__main__":
