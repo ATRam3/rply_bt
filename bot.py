@@ -1,21 +1,26 @@
 """
-Quiz answer userbot (final, reply-to-post edition)
---------------------------------------------------
-* Watches the quiz channel and logs EVERY post (text, photo, video...).
+Quiz answer userbot (FAST edition)
+----------------------------------
+* Logs EVERY post of the quiz channel (text, photo, video...).
 * Answers ONLY image posts, as a REPLY to that post's copy in the linked discussion group.
-* Reads the question (OCR, Gemini backup), looks up REAL candles (MT5 live or mt5_prices.json)
-  and posts the number.
-* NEVER guesses: if the candle data does not cover the week asked, it refuses and says why.
-* Detects other copies of itself (same account) and warns loudly.
+* OCR passes run in PARALLEL, and Gemini RACES the OCR (first valid answer wins).
+* The post's copy in the group is found by PUSH (instant) with API polling as backup.
+* NEVER guesses: if candle data does not cover the week asked, it refuses and says why.
+* Prints per-stage timings so you can see exactly where time goes.
 
-Test without Telegram:   python bot_final.py --test path/to/quiz.png
+Test without Telegram:   python bot_fast.py --test path/to/quiz.png
 
 .env keys
-    TELEGRAM_API_ID, TELEGRAM_API_HASH, TARGET_CHANNEL, TARGET_CHAT   (required)
-    GEMINI_API_KEY, GEMINI_MODEL, USE_GEMINI_FALLBACK=1               (optional)
-    HYPE_ENABLED=0, SHOW_GROUP_MESSAGES=0                             (optional)
-    REPLY_FALLBACK_TO_PLAIN=1   post a plain message if the post's copy can't be found
-                                (set 0 to post nothing in that case)
+  required : TELEGRAM_API_ID, TELEGRAM_API_HASH, TARGET_CHANNEL, TARGET_CHAT
+  optional : GEMINI_API_KEY, GEMINI_MODEL=gemini-2.5-flash
+             GEMINI_MODE=race|fallback|off     (default race; legacy USE_GEMINI_FALLBACK=0 -> off)
+             GEMINI_TIMEOUT=6
+             OCR_WORKERS=<n>                   (default: cpu count, 2..4)
+             POLL_INTERVAL=1.0                 (safety-net poll, seconds)
+             DISCUSSION_GRACE=3.0              (max extra wait for the post's copy once answer is ready)
+             REPLY_FALLBACK_TO_PLAIN=1         (post plain message if the copy is not found)
+             PRE_SEND_GUARD=0                  (1 = slower, checks history for duplicates before sending)
+             HYPE_ENABLED=0, SHOW_GROUP_MESSAGES=0, LOG_LEVEL=INFO
 """
 from __future__ import annotations
 
@@ -27,15 +32,20 @@ import random
 import re
 import socket
 import sys
+import threading
 import time
+import warnings
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 from dotenv import load_dotenv
 
+load_dotenv()
+
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("bot")
@@ -44,7 +54,27 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-load_dotenv()
+# Tesseract spawns its own threads; with several passes in parallel that causes oversubscription.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
+# ── Speed-ups that are optional but free ─────────────────────────────────
+try:
+    import tgcrypto  # noqa: F401
+
+    log.info("⚡ tgcrypto: active (fast encryption)")
+except ImportError:
+    log.warning("⚠️ tgcrypto missing -> run `pip install tgcrypto` (noticeably faster downloads/sends)")
+
+if os.name != "nt":
+    try:
+        import uvloop
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            uvloop.install()
+        log.info("⚡ uvloop: active")
+    except ImportError:
+        log.info("ℹ️ uvloop not installed (optional, Linux only): pip install uvloop")
 
 import pandas as pd
 from PIL import Image, ImageFilter, ImageOps, ImageStat
@@ -105,36 +135,47 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 API_ID = _env_int("TELEGRAM_API_ID")
 API_HASH = os.getenv("TELEGRAM_API_HASH")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TARGET_CHANNEL = _env_int("TARGET_CHANNEL")  # quiz channel (we READ it)
 TARGET_CHAT = _env_int("TARGET_CHAT")        # linked discussion group (we ANSWER there)
 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-USE_GEMINI_FALLBACK = _env_flag("USE_GEMINI_FALLBACK", "1")
+GEMINI_MODE = os.getenv("GEMINI_MODE", "race" if _env_flag("USE_GEMINI_FALLBACK", "1") else "off").lower()
+GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "6"))
+client_ai = genai.Client(api_key=GEMINI_API_KEY) if (genai and GEMINI_API_KEY) else None
+if not client_ai:
+    GEMINI_MODE = "off"
+
 HYPE_ENABLED = _env_flag("HYPE_ENABLED")
 SHOW_GROUP_MESSAGES = _env_flag("SHOW_GROUP_MESSAGES")
 REPLY_FALLBACK_TO_PLAIN = _env_flag("REPLY_FALLBACK_TO_PLAIN", "1")
+PRE_SEND_GUARD = _env_flag("PRE_SEND_GUARD")
 
-client_ai = genai.Client(api_key=GEMINI_API_KEY) if (genai and GEMINI_API_KEY) else None
-
-MAX_POST_AGE = 180        # ignore image posts older than this (seconds)
-POLL_INTERVAL = 1.5
+MAX_POST_AGE = 180          # ignore image posts older than this (seconds)
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))
+DISCUSSION_GRACE = float(os.getenv("DISCUSSION_GRACE", "3.0"))
+DISCUSSION_MAX_WAIT = 20.0  # absolute cap for looking up the post's copy
 MT5_CACHE_TTL = 5
-SESSION_WINDOW = 1800     # a session active in the last 30 min counts as "running"
-DISCUSSION_ATTEMPTS = 20  # how many times to look for the post's copy in the group
-DISCUSSION_DELAY = 0.5
+SESSION_WINDOW = 1800
 LOCK_PORT = 47831
+
+OCR_MIN_W, OCR_MAX_W = 1000, 1400   # smaller image = faster Tesseract; raise OCR_MAX_W if accuracy drops
+OCR_WORKERS = int(os.getenv("OCR_WORKERS", str(max(2, min(4, os.cpu_count() or 2)))))
+OCR_POOL = ThreadPoolExecutor(max_workers=OCR_WORKERS, thread_name_prefix="ocr")
+OCR_PASSES = [(False, 6), (True, 6), (False, 11), (True, 3)]  # (binarize, psm) — first has priority
 
 app = Client("fast_image_userbot", api_id=API_ID, api_hash=API_HASH, sleep_threshold=20)
 
 # ── State ────────────────────────────────────────────────────────────────
 _mt5_initialized = False
+_data_lock = threading.Lock()  # MT5 API is not guaranteed thread-safe
 _symbol_cache: dict[str, tuple[float, dict]] = {}
 _json_frames: dict[str, tuple[pd.DataFrame, int]] = {}
 _json_meta: dict = {"generated_at": None, "mtime": None}
 
 _SEEN_MAX = 1000
 _seen: "OrderedDict[tuple, float]" = OrderedDict()
+_bg_tasks: set[asyncio.Task] = set()
 
 
 def _claim(key: tuple) -> bool:
@@ -145,6 +186,23 @@ def _claim(key: tuple) -> bool:
     while len(_seen) > _SEEN_MAX:
         _seen.popitem(last=False)
     return True
+
+
+def _spawn(coro) -> asyncio.Task:
+    """create_task that keeps a reference so the task is never garbage-collected."""
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
+
+
+async def _cancel(task: asyncio.Future | None) -> None:
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -364,31 +422,31 @@ def _resolve_symbol(ticker: str) -> str:
 def get_market_data(ticker: str) -> dict | None:
     try:
         mt5_symbol = _resolve_symbol(ticker)
-        cached = _symbol_cache.get(mt5_symbol)
-        if cached and (time.time() - cached[0]) < MT5_CACHE_TTL:
-            return cached[1]
+        with _data_lock:
+            cached = _symbol_cache.get(mt5_symbol)
+            if cached and (time.time() - cached[0]) < MT5_CACHE_TTL:
+                return cached[1]
 
-        data = None
-        if MT5_AVAILABLE:
-            if ensure_mt5() or ensure_mt5(force_retry=True):
-                data = _fetch_mt5_symbol(mt5_symbol)
-                if data:
-                    _symbol_cache[mt5_symbol] = (time.time(), data)
+            data = None
+            if MT5_AVAILABLE:
+                if ensure_mt5() or ensure_mt5(force_retry=True):
+                    data = _fetch_mt5_symbol(mt5_symbol)
+                    if not data:
+                        log.warning(f"⚠️ '{mt5_symbol}' not in Market Watch — trying JSON")
                 else:
-                    log.warning(f"⚠️ '{mt5_symbol}' not in Market Watch — trying JSON")
-            else:
-                log.warning("⚠️ MT5 unavailable — trying JSON")
+                    log.warning("⚠️ MT5 unavailable — trying JSON")
 
-        if data is None and mt5_symbol in _json_frames:
-            df, digits = _json_frames[mt5_symbol]
-            data = _build_keys(df, digits)
-            data["source"] = f"JSON generated {_json_meta['generated_at']}"
+            if data is None and mt5_symbol in _json_frames:
+                df, digits = _json_frames[mt5_symbol]
+                data = _build_keys(df, digits)
+                data["source"] = f"JSON generated {_json_meta['generated_at']}"
 
-        if data is None:
-            log.error(f"❌ No data for {mt5_symbol} (not in MT5 or JSON)")
-            return None
-        data["symbol"] = mt5_symbol
-        return data
+            if data is None:
+                log.error(f"❌ No data for {mt5_symbol} (not in MT5 or JSON)")
+                return None
+            data["symbol"] = mt5_symbol
+            _symbol_cache[mt5_symbol] = (time.time(), data)
+            return data
     except Exception as e:
         log.error(f"❌ Error fetching {ticker}: {e}")
         return None
@@ -399,7 +457,7 @@ def _pre_warm_cache() -> None:
         return
     for sym in PREWARM_SYMBOLS:
         if mt5.symbol_select(sym, True):
-            log.info(f"  ✅ Selected {sym}")
+            log.debug(f"  ✅ Selected {sym}")
 
 
 def _lookup(ticker: str, qtype: str) -> str | None:
@@ -409,6 +467,10 @@ def _lookup(ticker: str, qtype: str) -> str | None:
     answer, info = _answer_from_data(data, qtype)
     log.info(f"{'🧮' if answer else '🛑'} {data.get('symbol', ticker)} → {answer} | {info}")
     return answer
+
+
+async def _lookup_async(ticker: str, qtype: str) -> str | None:
+    return await asyncio.get_running_loop().run_in_executor(None, _lookup, ticker, qtype)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -457,136 +519,259 @@ def _parse_question_type(text: str) -> str | None:
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# OCR + GEMINI
+# SOLVERS: OCR (parallel passes) + GEMINI (async)   -> raced in solve_image()
 # ═════════════════════════════════════════════════════════════════════════
-def _prep_for_ocr(img: Image.Image, binarize: bool) -> Image.Image:
+def _open_image(photo: BytesIO) -> Image.Image:
+    photo.seek(0)
+    img = Image.open(photo)
+    img.load()
+    return img
+
+
+def _base_prep(img: Image.Image) -> Image.Image:
+    """Heavy preprocessing done ONCE and shared by every OCR pass."""
     g = img.convert("L")
-    if g.width < 1000:
-        f = 1000 / g.width
-        g = g.resize((int(g.width * f), int(g.height * f)), Image.LANCZOS)
-    elif g.width > 1800:
-        f = 1800 / g.width
-        g = g.resize((int(g.width * f), int(g.height * f)), Image.LANCZOS)
+    w = g.width
+    if w < OCR_MIN_W or w > OCR_MAX_W:
+        f = (OCR_MIN_W if w < OCR_MIN_W else OCR_MAX_W) / w
+        g = g.resize((int(w * f), int(g.height * f)), Image.BICUBIC)
     g = ImageOps.autocontrast(g)
     if ImageStat.Stat(g).mean[0] < 110:  # dark card -> invert (Tesseract wants dark-on-light)
         g = ImageOps.invert(g)
-    if binarize:
-        g = g.filter(ImageFilter.SHARPEN).point(lambda x: 255 if x > 140 else 0)
     return g
 
 
-def solve_with_ocr(img: Image.Image) -> str | None:
-    t0 = time.time()
-    all_text: list[str] = []
+def _ocr_pass(base: Image.Image, binarize: bool, psm: int) -> str:
+    g = base
+    if binarize:
+        g = g.filter(ImageFilter.SHARPEN).point(lambda x: 255 if x > 140 else 0)
+    return pytesseract.image_to_string(g, config=f"--psm {psm}").strip()
+
+
+async def solve_with_ocr(img: Image.Image) -> str | None:
+    loop = asyncio.get_running_loop()
+    t0 = time.perf_counter()
+    base = await loop.run_in_executor(OCR_POOL, _base_prep, img)
+    # all passes start at once; pass #1 keeps priority, the others are only used if it fails
+    futs = [loop.run_in_executor(OCR_POOL, _ocr_pass, base, b, p) for b, p in OCR_PASSES]
+    texts: list[str] = []
     ticker = qtype = None
-
-    for binarize, psm in [(False, 6), (True, 6), (False, 11), (True, 3)]:
+    try:
         try:
-            text = pytesseract.image_to_string(
-                _prep_for_ocr(img, binarize), config=f"--psm {psm}"
-            ).strip()
+            first = await futs[0]
         except Exception as e:
-            log.warning(f"OCR pass failed (psm {psm}): {e}")
-            continue
-        if not text:
-            continue
-        all_text.append(text)
-        ticker, qtype = _find_ticker(text), _parse_question_type(text)
-        if ticker and qtype:
-            break
+            log.warning(f"OCR pass 1 failed: {e}")
+            first = ""
+        if first:
+            texts.append(first)
+            ticker, qtype = _find_ticker(first), _parse_question_type(first)
 
-    if not (ticker and qtype) and all_text:
-        merged = "\n".join(all_text)
+        pending = set(futs[1:])
+        while pending and not (ticker and qtype):
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for f in done:
+                try:
+                    text = f.result()
+                except Exception:
+                    continue
+                if not text:
+                    continue
+                texts.append(text)
+                tk, qt = _find_ticker(text), _parse_question_type(text)
+                if tk and qt:
+                    ticker, qtype = tk, qt
+                    break
+    finally:
+        for f in futs:  # not-yet-started passes are dropped, running ones finish harmlessly
+            f.cancel()
+
+    if not (ticker and qtype) and texts:
+        merged = "\n".join(texts)
         ticker = ticker or _find_ticker(merged)
         qtype = qtype or _parse_question_type(merged)
 
-    log.info("📝 OCR text:\n" + ("\n".join(all_text)[:600] or "(nothing read)"))
-    log.info(f"⏱️  OCR {time.time() - t0:.2f}s | ticker={ticker} | type={qtype}")
+    log.debug("📝 OCR text:\n" + ("\n".join(texts)[:600] or "(nothing read)"))
+    log.info(f"⏱️  OCR {time.perf_counter() - t0:.2f}s | ticker={ticker} | type={qtype}")
     if not ticker or not qtype:
         return None
-    return _lookup(ticker, qtype)
+    return await _lookup_async(ticker, qtype)
 
 
-def solve_with_gemini(img: Image.Image) -> str | None:
+GEMINI_TYPES = {"THIS_WEEK_LOW", "THIS_WEEK_HIGH", "LAST_WEEK_LOW", "LAST_WEEK_HIGH",
+                "PERIOD_LOW", "PERIOD_HIGH", "LATEST_CLOSE"}
+GEMINI_PROMPT = (
+    "This is a trading quiz image. Reply ONLY in the format SYMBOL|TYPE.\n"
+    "SYMBOL: the instrument ticker (e.g. XAUUSD, GBPJPY, NASDAQ).\n"
+    "TYPE: one of THIS_WEEK_LOW, THIS_WEEK_HIGH, LAST_WEEK_LOW, LAST_WEEK_HIGH, "
+    "PERIOD_LOW, PERIOD_HIGH, LATEST_CLOSE.\nExample: GBPJPY|LAST_WEEK_LOW"
+)
+
+
+def _gemini_config():
+    """Fast, deterministic, no 'thinking' — we only need two tokens back."""
+    try:
+        from google.genai import types
+
+        return types.GenerateContentConfig(
+            temperature=0,
+            max_output_tokens=24,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
+    except Exception:
+        return None
+
+
+_GEMINI_CFG = _gemini_config() if client_ai else None
+
+
+def _thumb(img: Image.Image) -> Image.Image:
+    small = img.copy()
+    small.thumbnail((768, 768))
+    return small
+
+
+async def solve_with_gemini(img: Image.Image) -> str | None:
     if not client_ai:
         return None
+    t0 = time.perf_counter()
     try:
-        small = img.copy()
-        small.thumbnail((768, 768))
-        prompt = (
-            "This is a trading quiz image. Reply ONLY in the format SYMBOL|TYPE.\n"
-            "SYMBOL: the instrument ticker (e.g. XAUUSD, GBPJPY, NASDAQ).\n"
-            "TYPE: one of THIS_WEEK_LOW, THIS_WEEK_HIGH, LAST_WEEK_LOW, LAST_WEEK_HIGH, "
-            "PERIOD_LOW, PERIOD_HIGH, LATEST_CLOSE.\nExample: GBPJPY|LAST_WEEK_LOW"
+        small = await asyncio.get_running_loop().run_in_executor(None, _thumb, img)
+        resp = await asyncio.wait_for(
+            client_ai.aio.models.generate_content(
+                model=GEMINI_MODEL, contents=[GEMINI_PROMPT, small], config=_GEMINI_CFG
+            ),
+            timeout=GEMINI_TIMEOUT,
         )
-        resp = client_ai.models.generate_content(model=GEMINI_MODEL, contents=[prompt, small])
-        result = (resp.text or "").strip().upper()
-        log.info(f"🔎 Gemini: {result}")
+        result = (resp.text or "").strip().upper().replace("`", "")
+        log.info(f"🔎 Gemini {time.perf_counter() - t0:.2f}s: {result}")
         if "|" not in result:
             return None
         symbol, qtype = (p.strip() for p in result.split("|", 1))
-        return _lookup(symbol, qtype)
+        if qtype not in GEMINI_TYPES:
+            return None
+        return await _lookup_async(symbol, qtype)
+    except asyncio.TimeoutError:
+        log.warning(f"⚠️ Gemini timed out after {GEMINI_TIMEOUT:.0f}s")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         log.error(f"❌ Gemini error: {e}")
-        return None
+    return None
 
 
-def solve_question_image(photo_bytes: BytesIO) -> str | None:
-    photo_bytes.seek(0)
-    img = Image.open(photo_bytes)
-    img.load()
-    answer = solve_with_ocr(img) if OCR_AVAILABLE else None
-    if answer is None and USE_GEMINI_FALLBACK:
-        answer = solve_with_gemini(img)
+async def solve_image(photo: BytesIO) -> str | None:
+    """
+    race     : OCR and Gemini start together, first valid answer wins (fastest).
+    fallback : Gemini only after OCR fails.
+    off      : OCR only.
+    """
+    loop = asyncio.get_running_loop()
+    img = await loop.run_in_executor(None, _open_image, photo)
+
+    tasks: list[asyncio.Task] = []
+    if OCR_AVAILABLE:
+        tasks.append(asyncio.create_task(solve_with_ocr(img), name="OCR"))
+    if client_ai and (GEMINI_MODE == "race" or (GEMINI_MODE == "fallback" and not OCR_AVAILABLE)):
+        tasks.append(asyncio.create_task(solve_with_gemini(img), name="GEMINI"))
+
+    answer: str | None = None
+    pending = set(tasks)
+    try:
+        while pending and answer is None:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                try:
+                    r = t.result()
+                except Exception as e:
+                    log.error(f"❌ {t.get_name()} failed: {e}")
+                    continue
+                if r:
+                    answer = r
+                    log.info(f"🏁 {t.get_name()} won the race")
+                    break
+    finally:
+        for t in pending:
+            t.cancel()
+
+    if answer is None and GEMINI_MODE == "fallback" and client_ai and OCR_AVAILABLE:
+        answer = await solve_with_gemini(img)
     return answer
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# DISCUSSION GROUP: find the channel post's copy and reply to it
+# DISCUSSION GROUP: find the channel post's copy (PUSH first, API as backup)
 # ═════════════════════════════════════════════════════════════════════════
-def _is_copy_of_post(m: Message, channel_id: int, post_id: int) -> bool:
-    """True if `m` (in the group) is the auto-forwarded copy of channel post `post_id`."""
-    # Older Pyrogram / Kurigram flat attributes
-    fc = getattr(m, "forward_from_chat", None)
-    if fc and fc.id == channel_id and getattr(m, "forward_from_message_id", None) == post_id:
-        return True
-    # Newer forward_origin style
-    fo = getattr(m, "forward_origin", None)
+_disc_cache: "OrderedDict[int, Message]" = OrderedDict()   # channel post id -> copy in group
+_disc_waiters: dict[int, asyncio.Future] = {}
+
+
+def _copy_source_id(m: Message) -> int | None:
+    """If `m` (in the group) is the auto-forward of a post from TARGET_CHANNEL, return that post's id."""
+    fc = getattr(m, "forward_from_chat", None)  # Pyrogram 2.0.x style
+    if fc and fc.id == TARGET_CHANNEL:
+        mid = getattr(m, "forward_from_message_id", None)
+        if mid:
+            return mid
+    fo = getattr(m, "forward_origin", None)     # newer style
     if fo:
         chat = getattr(fo, "chat", None)
-        if chat and chat.id == channel_id and getattr(fo, "message_id", None) == post_id:
-            return True
-    return False
+        if chat and chat.id == TARGET_CHANNEL:
+            mid = getattr(fo, "message_id", None)
+            if mid:
+                return mid
+    return None
 
 
-async def _find_discussion_message(client: Client, post_id: int) -> Message | None:
-    """
-    Returns the message in the discussion group that mirrors the channel post (the message you
-    'reply' to). Retries because Telegram needs a moment to create the copy.
-    """
-    for _ in range(DISCUSSION_ATTEMPTS):
-        # Method 1: official API
-        getter = getattr(client, "get_discussion_message", None)
+def _remember_copy(post_id: int, msg: Message) -> None:
+    _disc_cache[post_id] = msg
+    while len(_disc_cache) > 200:
+        _disc_cache.popitem(last=False)
+    fut = _disc_waiters.get(post_id)
+    if fut and not fut.done():
+        fut.set_result(msg)
+
+
+async def _discussion_via_api(client: Client, post_id: int, fut: asyncio.Future) -> None:
+    """Backup lookup, in case the push update for the group copy is late or missed."""
+    getter = getattr(client, "get_discussion_message", None)
+    attempt = 0
+    while not fut.done():
+        attempt += 1
         if getter:
             try:
                 dm = await getter(TARGET_CHANNEL, post_id)
                 if dm:
-                    return dm
+                    _remember_copy(post_id, dm)
+                    return
             except FloodWait as fw:
                 await asyncio.sleep(fw.value)
             except Exception as e:
-                log.debug(f"get_discussion_message not ready yet: {e}")
+                log.debug(f"get_discussion_message not ready: {e}")
+        if attempt % 3 == 0:
+            try:
+                async for m in client.get_chat_history(TARGET_CHAT, limit=15):
+                    if _copy_source_id(m) == post_id:
+                        _remember_copy(post_id, m)
+                        return
+            except Exception as e:
+                log.debug(f"history scan failed: {e}")
+        await asyncio.sleep(0.3)
 
-        # Method 2: scan the group's recent history for the forwarded copy
-        try:
-            async for m in client.get_chat_history(TARGET_CHAT, limit=20):
-                if _is_copy_of_post(m, TARGET_CHANNEL, post_id):
-                    return m
-        except Exception as e:
-            log.debug(f"history scan failed: {e}")
 
-        await asyncio.sleep(DISCUSSION_DELAY)
-    return None
+async def _find_discussion_message(client: Client, post_id: int) -> Message | None:
+    cached = _disc_cache.get(post_id)
+    if cached:
+        return cached
+    fut = asyncio.get_running_loop().create_future()
+    _disc_waiters[post_id] = fut
+    api = asyncio.create_task(_discussion_via_api(client, post_id, fut))
+    try:
+        return await asyncio.wait_for(fut, DISCUSSION_MAX_WAIT)
+    except asyncio.TimeoutError:
+        return None
+    finally:
+        _disc_waiters.pop(post_id, None)
+        await _cancel(api)
 
 
 async def _send_answer(client: Client, disc_msg: Message | None, answer: str) -> str:
@@ -610,13 +795,12 @@ async def _send_with_flood_retry(client: Client, disc_msg: Message | None, answe
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# DUPLICATE GUARD ACROSS COPIES (other PC / Codespaces / old script, same account)
+# DUPLICATE DETECTION (other PC / Codespaces / old script, same account)
 # ═════════════════════════════════════════════════════════════════════════
 _NUM_RE = re.compile(r"^-?\d[\d.,]*$")
 
 
 async def _own_numeric_posts(client: Client, since_ts: float) -> list[tuple[int, str]]:
-    """Numeric answers THIS ACCOUNT already posted in the group since `since_ts`."""
     found: list[tuple[int, str]] = []
     try:
         async for m in client.get_chat_history(TARGET_CHAT, limit=20):
@@ -631,6 +815,7 @@ async def _own_numeric_posts(client: Client, since_ts: float) -> list[tuple[int,
 
 
 async def _audit_after(client: Client, since_ts: float, mine: str) -> None:
+    """Runs AFTER sending, so it costs no speed."""
     await asyncio.sleep(4)
     posts = await _own_numeric_posts(client, since_ts)
     if len(posts) > 1:
@@ -640,7 +825,6 @@ async def _audit_after(client: Client, since_ts: float, mine: str) -> None:
 
 
 async def _warn_other_sessions(client: Client) -> None:
-    """Lists other sessions of this account using the same API ID that were active recently."""
     try:
         from pyrogram.raw.functions.account import GetAuthorizations
 
@@ -694,15 +878,6 @@ def _is_image(m: Message) -> bool:
     return bool(m.document and (m.document.mime_type or "").startswith("image/"))
 
 
-async def _cancel(task: asyncio.Task | None) -> None:
-    if task and not task.done():
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
-
-
 async def handle_channel_post(client: Client, message: Message, source: str) -> None:
     """Called by BOTH the push handler and the poller; the first to see a post wins."""
     if not _claim(("post", message.id)):
@@ -721,17 +896,19 @@ async def handle_channel_post(client: Client, message: Message, source: str) -> 
         log.info("   ↳ image is too old — no reply")
         return
 
-    t_start = time.time()
+    t0 = time.perf_counter()
     answer: str | None = None
 
-    # Start looking for the post's copy in the group NOW, in parallel with solving
+    # Look for the post's copy in the group NOW, in parallel with download + solving
     disc_task = asyncio.create_task(_find_discussion_message(client, message.id))
 
     try:
         photo = await client.download_media(message, in_memory=True)
-        answer = await asyncio.to_thread(solve_question_image, photo)
+        t_dl = time.perf_counter()
+        answer = await solve_image(photo)
+        t_solve = time.perf_counter()
         if answer:
-            log.info(f"   ✅ Calculated answer: {answer}")
+            log.info(f"   ✅ Answer {answer} | download {t_dl - t0:.2f}s | solve {t_solve - t_dl:.2f}s")
     except Exception as e:
         log.error(f"❌ Image handling error: {e}")
 
@@ -740,33 +917,39 @@ async def handle_channel_post(client: Client, message: Message, source: str) -> 
         log.info("   ↳ no trustworthy answer — nothing posted")
         return
 
-    # Cross-copy guard: did another copy of this account already answer this quiz?
-    await asyncio.sleep(random.uniform(0.15, 0.6))
-    existing = await _own_numeric_posts(client, post_ts - 3)
-    if existing:
-        texts = [t for _, t in existing]
-        if answer in texts:
-            await _cancel(disc_task)
-            log.info(f"   ↳ another copy already posted the same answer {answer} — skipping")
-            return
-        log.error(f"🚨 CONFLICT: another copy of this account posted {texts} but I computed {answer}. "
-                  f"Posting mine too — and you must stop the other copy!")
+    if PRE_SEND_GUARD:  # off by default: costs one extra network round trip
+        existing = await _own_numeric_posts(client, post_ts - 3)
+        if existing:
+            texts = [t for _, t in existing]
+            if answer in texts:
+                await _cancel(disc_task)
+                log.info(f"   ↳ another copy already posted {answer} — skipping")
+                return
+            log.error(f"🚨 CONFLICT: another copy posted {texts} but I computed {answer}.")
 
-    disc_msg: Message | None = None
-    try:
-        disc_msg = await disc_task
-    except Exception as e:
-        log.warning(f"⚠️ Could not locate the post in the group: {e}")
+    # The copy is usually already here by now; wait only a short grace period if it isn't.
+    disc_msg: Message | None = _disc_cache.get(message.id)
+    if disc_msg is None:
+        try:
+            disc_msg = await asyncio.wait_for(asyncio.shield(disc_task), DISCUSSION_GRACE)
+        except asyncio.TimeoutError:
+            disc_msg = _disc_cache.get(message.id)
+        except Exception as e:
+            log.warning(f"⚠️ Could not locate the post in the group: {e}")
+    await _cancel(disc_task)
 
     if disc_msg is None:
         log.warning("⚠️ Discussion copy of the post NOT found — "
                     + ("posting a plain message" if REPLY_FALLBACK_TO_PLAIN else "not posting"))
 
+    t_send = time.perf_counter()
     try:
         mode = await _send_with_flood_retry(client, disc_msg, answer)
         label = "as REPLY to the post" if mode == "reply" else "as plain message"
-        log.info(f"🚀 POSTED {answer} {label} in {time.time() - t_start:.1f}s")
-        asyncio.create_task(_audit_after(client, post_ts - 3, answer))
+        now = time.perf_counter()
+        log.info(f"🚀 POSTED {answer} {label} | send {now - t_send:.2f}s | TOTAL {now - t0:.2f}s "
+                 f"(since the bot saw the post)")
+        _spawn(_audit_after(client, post_ts - 3, answer))
     except Exception as e:
         log.error(f"❌ Failed to post to group: {e}")
 
@@ -778,12 +961,16 @@ async def on_channel_message(client: Client, message: Message):
 
 @app.on_message(filters.chat(TARGET_CHAT), group=1)
 async def on_group_message(client: Client, message: Message):
-    if not SHOW_GROUP_MESSAGES:
-        return
-    who = (message.from_user.first_name if message.from_user
-           else message.sender_chat.title if message.sender_chat else "?")
-    preview = (message.text or message.caption or "").replace("\n", " ")[:60]
-    log.info(f"   💬 [GROUP] #{message.id} {_post_kind(message)} from {who}: {preview}")
+    # Instantly remember the auto-forwarded copy of every channel post (this is what we reply to)
+    src = _copy_source_id(message)
+    if src is not None:
+        _remember_copy(src, message)
+
+    if SHOW_GROUP_MESSAGES:
+        who = (message.from_user.first_name if message.from_user
+               else message.sender_chat.title if message.sender_chat else "?")
+        preview = (message.text or message.caption or "").replace("\n", " ")[:60]
+        log.info(f"   💬 [GROUP] #{message.id} {_post_kind(message)} from {who}: {preview}")
 
 
 # ── Optional hype message ────────────────────────────────────────────────
@@ -814,7 +1001,7 @@ async def hype_handler(client: Client, message: Message):
 # POLLING SAFETY NET + KEEP ONLINE
 # ═════════════════════════════════════════════════════════════════════════
 async def _poll_channel(client: Client) -> None:
-    log.info("🔄 Polling safety net started")
+    log.info(f"🔄 Polling safety net started (every {POLL_INTERVAL:.1f}s)")
     last_seen: int | None = None
     delay = POLL_INTERVAL
 
@@ -835,8 +1022,7 @@ async def _poll_channel(client: Client) -> None:
             else:
                 for msg in reversed(new):
                     last_seen = max(last_seen, msg.id)
-                    # run as a task so a slow solve never blocks the poller
-                    asyncio.create_task(handle_channel_post(client, msg, "POLL"))
+                    _spawn(handle_channel_post(client, msg, "POLL"))  # never blocks the poller
             delay = POLL_INTERVAL
         except FloodWait as fw:
             await asyncio.sleep(fw.value + 1)
@@ -858,6 +1044,28 @@ async def _keep_online(client: Client) -> None:
         except Exception as e:
             log.warning(f"🟢 keep_online error: {e}")
         await asyncio.sleep(240)
+
+
+async def _warm_up() -> None:
+    """First Tesseract call / first HTTPS handshake are slow; pay that cost at startup, not on quiz time."""
+    loop = asyncio.get_running_loop()
+    if OCR_AVAILABLE:
+        try:
+            t = time.perf_counter()
+            await loop.run_in_executor(OCR_POOL, _ocr_pass, Image.new("L", (300, 80), 255), False, 6)
+            log.info(f"🔥 OCR warmed up in {time.perf_counter() - t:.2f}s")
+        except Exception as e:
+            log.debug(f"OCR warm-up failed: {e}")
+    if client_ai and GEMINI_MODE != "off":
+        try:
+            t = time.perf_counter()
+            await asyncio.wait_for(
+                client_ai.aio.models.generate_content(model=GEMINI_MODEL, contents="ok", config=_GEMINI_CFG),
+                timeout=10,
+            )
+            log.info(f"🔥 Gemini connection warmed up in {time.perf_counter() - t:.2f}s")
+        except Exception as e:
+            log.debug(f"Gemini warm-up failed: {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -887,7 +1095,6 @@ async def _startup_checks(client: Client) -> None:
         except Exception as e:
             sys.exit(f"❌ Cannot resolve {chat_id}: {e}")
 
-    # Verify the group really is the channel's discussion group (needed for replies)
     try:
         ch = await client.get_chat(TARGET_CHANNEL)
         linked = getattr(ch, "linked_chat", None)
@@ -895,7 +1102,7 @@ async def _startup_checks(client: Client) -> None:
             log.error(f"🚨 TARGET_CHAT ({TARGET_CHAT}) is NOT the channel's linked discussion group "
                       f"({linked.id}). Replies to posts will not work until you fix .env.")
         elif linked:
-            log.info(f"   ✅ TARGET_CHAT is the linked discussion group of the channel")
+            log.info("   ✅ TARGET_CHAT is the linked discussion group of the channel")
         else:
             log.warning("   ⚠️ Could not confirm the channel's linked discussion group")
     except Exception as e:
@@ -906,9 +1113,9 @@ async def _startup_checks(client: Client) -> None:
     await _warn_other_sessions(client)
     log.info(
         f"✅ Watching channel {TARGET_CHANNEL} | replying to image posts in group {TARGET_CHAT}\n"
-        f"   Hype: {'ON' if HYPE_ENABLED else 'OFF'} | "
-        f"Gemini fallback: {'ON' if (USE_GEMINI_FALLBACK and client_ai) else 'OFF'} | "
+        f"   Gemini: {GEMINI_MODE.upper()} | OCR workers: {OCR_WORKERS} | Poll: {POLL_INTERVAL:.1f}s | "
         f"Plain fallback: {'ON' if REPLY_FALLBACK_TO_PLAIN else 'OFF'} | "
+        f"Pre-send guard: {'ON' if PRE_SEND_GUARD else 'OFF'} | "
         f"Data: {'MT5 live' if MT5_AVAILABLE else 'JSON ' + str(_json_meta['generated_at'])}"
     )
 
@@ -939,7 +1146,11 @@ async def main() -> None:
     await app.start()
     await _startup_checks(app)
 
-    tasks = [asyncio.create_task(_poll_channel(app)), asyncio.create_task(_keep_online(app))]
+    tasks = [
+        asyncio.create_task(_poll_channel(app)),
+        asyncio.create_task(_keep_online(app)),
+        asyncio.create_task(_warm_up()),
+    ]
     log.info("🤖 Bot is running. Press Ctrl+C to stop.")
     try:
         await idle()
@@ -947,6 +1158,7 @@ async def main() -> None:
         for t in tasks:
             t.cancel()
         await app.stop()
+        OCR_POOL.shutdown(wait=False, cancel_futures=True)
         if MT5_AVAILABLE and _mt5_initialized:
             mt5.shutdown()
         log.info("👋 Bot stopped.")
@@ -958,7 +1170,9 @@ if __name__ == "__main__":
         if MT5_AVAILABLE:
             ensure_mt5()
         with open(sys.argv[2], "rb") as fh:
-            print("\n➡️ ANSWER:", solve_question_image(BytesIO(fh.read())))
+            t_start = time.perf_counter()
+            result = asyncio.run(solve_image(BytesIO(fh.read())))
+            print(f"\n➡️ ANSWER: {result}   ({time.perf_counter() - t_start:.2f}s)")
         sys.exit(0)
 
     _lock = _single_instance_lock()
